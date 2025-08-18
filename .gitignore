@@ -1,0 +1,28 @@
+.local
+
+# Ignore compiled bash scripts (if any)
+*.shc
+
+# Ignore backup and temp files
+*~
+*.bak
+*.tmp
+
+# Ignore log files
+*.log
+
+# Ignore environment files
+.env
+.env.*
+
+# Ignore node_modules and dist (se usar JS/TS)
+node_modules/
+dist/
+
+# Ignore Python cache (se usar Python)
+__pycache__/
+*.pyc
+
+# Ignore macOS and Windows system files
+.DS_Store
+Thumbs.db
