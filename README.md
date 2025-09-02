@@ -1,38 +1,59 @@
 # azure-utils
 
-Utilities to make common Azure clean-up and maintenance tasks fast and reliable. The repository is organized by shell/language so you can pick the tools that fit your workflow. Each script includes a short header describing what it does, prerequisites, and usage examples.
-
-## Directory layout
-- `ps/` — PowerShell scripts (pwsh) that leverage Azure CLI and Azure management/data-plane APIs.
-- `bash/` — Bash scripts for Linux/macOS environments.
-
-More folders and scripts may be added over time. Explore the directories to see what’s available and read the script headers before running them.
+Handy scripts to speed up common Azure cleanup and maintenance. Each script has a quick description and a ready-to-run one-liner.
 
 ## Prerequisites
-- Azure CLI (az) installed and authenticated: `az login`
-- Appropriate Azure permissions for the resources you intend to manage
-- For PowerShell scripts: PowerShell 7+ (pwsh)
-- For Bash scripts: a POSIX shell environment
+- Azure CLI (`az`) installed and logged in: `az login`
+- Permissions to manage the target resources
+- **PowerShell 7+ (`pwsh`)** for the commands below
 
-## Quick start
-1) Open the directory matching your shell (for example, `ps/`).
-2) Read a script’s header for its overview, prerequisites, and examples.
-3) Run from the repo root or the script’s folder. Many scripts are interactive and remember your last inputs.
+## Run it quick with PowerShell 7
+> **Note**  
+> Just copy and paste the commands below into your PowerShell 7 terminal and run them.  
 
-Examples
+### Make RG resources publicly reachable - `ps/set-public.ps1`
+Turns on public network access for Storage Accounts, Key Vaults, and Cosmos DB in a resource group (doesn’t remove private endpoints).
 ```powershell
-# PowerShell (pwsh)
-.\ps\<script-name>.ps1 [options]
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/set-public.ps1').Content"
+````
+
+---
+
+### Get a Dapr token for local/dev use - `ps/get-dapr-token.ps1`
+
+Pulls a Dapr API token (for local/dev scenarios) so you can wire up services quickly.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/get-dapr-token.ps1').Content"
 ```
 
-```bash
-# Bash
-bash/<script-name>.sh [options]
+---
+
+### Safe, forceful Resource Group cleanup & delete - `ps/rm-rg.ps1`
+
+Clears out common blockers (NSGs, Private Endpoints, SALs, subnet settings, peerings, PDNS links, locks) and then deletes the RG.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/rm-rg.ps1').Content"
 ```
 
-## Troubleshooting
-- If a resource group deletion flips from `Deleting` back to `Succeeded`, there are blockers; check the script output for warnings/errors (for example, gateways, firewalls, or service association links), resolve them, and retry.
-- If a data-plane operation returns 0 changes, verify the target has content and your account has the required permissions.
+---
+
+### Remove documents from an Azure AI Search index - `ps/rm-index-documents.ps1`
+
+Deletes documents from a target Search index (by key or filter) to keep the index clean.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/rm-index-documents.ps1').Content"
+```
+
+---
+
+## Directory layout
+
+* `ps/` — PowerShell 7 (pwsh) scripts using Azure CLI and Azure APIs
+* `bash/` — Bash scripts for Linux/macOS (available, but not covered in Quick Start)
 
 ## License
-This project is licensed under the MIT License. See [LICENSING.md](./LICENSING.md) for details.
+
+MIT — see [LICENSING.md](./LICENSING.md).
