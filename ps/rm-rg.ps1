@@ -21,7 +21,7 @@ param(
   [int]$PollSeconds = 10
 )
 
-# Relaunch em pwsh se estiver em Windows PowerShell (não-Core)
+# Relaunch in pwsh if running under Windows PowerShell (non-Core)
 if ($PSVersionTable.PSEdition -ne 'Core') {
   $url = 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/rm-rg.ps1'
   $tmp = Join-Path $env:TEMP "rm-rg-$([guid]::NewGuid()).ps1"
@@ -37,10 +37,10 @@ $ErrorActionPreference = 'Stop'
 $script:SUB = $null
 $script:RG  = $null
 
-# State file para lembrar SUB/RG
+# State file (remember last subscription/RG)
 $StateFile = Join-Path $env:TEMP 'cleanup-nsgs-last.ps1'
 
-# ---------- Helpers SAL (ACA) ----------
+# -------------------- SAL (ACA) helpers --------------------
 function Get-Subnet-SAL-Ids {
   param($rg, $vnet, $subnet)
   try {
@@ -66,7 +66,7 @@ function Delete-SALs-CLI {
     if ([string]::IsNullOrWhiteSpace($sid)) { continue }
     Write-Host "   - Deleting Service Association Link (CLI): $sid"
 
-    # Tenta com 2 API versions; 5 tentativas cada; última tentativa é --verbose
+    # Try a couple of API versions; up to 5 attempts each; final attempt is --verbose to reveal tenant-policy blocks.
     $apis = @('2024-03-01','2023-09-01')
     $deleted = $false
     foreach ($api in $apis) {
@@ -95,7 +95,100 @@ function Delete-SALs-CLI {
   return $ok
 }
 
-# ---------- Prompt ----------
+function Ensure-AzModules {
+  try {
+    Import-Module Az.Accounts -ErrorAction Stop
+    Import-Module Az.Resources -ErrorAction Stop
+  } catch {
+    Write-Host "   - Installing Az module (CurrentUser)..." -ForegroundColor Yellow
+    Install-Module Az -Scope CurrentUser -Force -AllowClobber
+    Import-Module Az.Accounts -ErrorAction Stop
+    Import-Module Az.Resources -ErrorAction Stop
+  }
+}
+
+function Delete-SALs-AzPS {
+  param($salIds, [string]$subscriptionId)
+  Ensure-AzModules
+  try {
+    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
+      Connect-AzAccount | Out-Null
+    }
+    if ($subscriptionId) {
+      Select-AzSubscription -SubscriptionId $subscriptionId | Out-Null
+    }
+  } catch {
+    Write-Host "   (warn) Az login/subscription selection failed; continuing best-effort." -ForegroundColor DarkYellow
+  }
+
+  $ok = $true
+  foreach ($sid in ($salIds -split "`n")) {
+    if ([string]::IsNullOrWhiteSpace($sid)) { continue }
+    Write-Host "   - [Az] Removing SAL: $sid"
+    $apis = @('2024-03-01','2023-09-01')
+    $deleted = $false
+    foreach ($api in $apis) {
+      try {
+        Remove-AzResource -ResourceId $sid -ApiVersion $api -Force -Confirm:$false -ErrorAction Stop
+        $deleted = $true; break
+      } catch {
+        Start-Sleep 3
+      }
+    }
+    if (-not $deleted) {
+      Write-Host "     (error) [Az] Remove failed: $sid" -ForegroundColor Red
+      $ok = $false
+    }
+  }
+  return $ok
+}
+
+function Delete-ACAEnvs-Referencing-Subnet {
+  param($subnetId)
+  # Cross-RG cleanup: remove any ACA Managed Environments that still point at this subnet
+  try {
+    $ids = az resource list --resource-type Microsoft.App/managedEnvironments `
+      --query "[?properties.vnetConfiguration.infrastructureSubnetId=='$subnetId'].id" -o tsv
+  } catch { $ids = '' }
+  foreach ($id in ($ids -split "`n")) {
+    if ($id) {
+      Write-Host "   - Deleting ACA Managed Environment (cross-RG): $id"
+      try { az resource delete --ids $id | Out-Null } catch {
+        Write-Host "     (warn) failed to delete ME: $id" -ForegroundColor DarkYellow
+      }
+    }
+  }
+}
+
+function Delete-ServiceAssociationLinks {
+  param($rg, $vnet, $subnet)
+  $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
+  if (-not $salIds) { return $true }  # nothing to do
+
+  # SAL requires the ACA delegation to exist while deleting
+  Ensure-ACA-Delegation -rg $rg -vnet $vnet -subnet $subnet
+
+  # First try with Azure CLI (fast path)
+  $ok = Delete-SALs-CLI -salIds $salIds
+
+  # If CLI fails (e.g., tenant blocks Azure CLI app), fallback to Az PowerShell
+  if (-not $ok) {
+    Write-Host "     (info) CLI failed (tenant may block the Azure CLI app). Trying Az PowerShell fallback…"
+    $subId = (az account show --query id -o tsv 2>$null).Trim()
+    $ok = Delete-SALs-AzPS -salIds $salIds -subscriptionId $subId
+  }
+
+  if (-not $ok) {
+    Write-Host "     (warn) Some SALs remain; cannot proceed clearing delegations on ${rg}/${vnet}/${subnet}." -ForegroundColor DarkYellow
+    return $false
+  }
+
+  # Double-check
+  $left = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
+  return (-not $left)
+}
+
+# -------------------- Prompt --------------------
 function Prompt-Context {
   if (Test-Path -Path $StateFile) {
     . $StateFile
@@ -129,7 +222,7 @@ function Prompt-Context {
   Set-Content -Path $StateFile -Value @("`$SUB = '$safeSub'","`$RG  = '$safeRg'") -Encoding UTF8
 }
 
-# ---------- Net helpers ----------
+# -------------------- Network helpers --------------------
 function Unset-Subnet-Props {
   param($rg, $vnet, $subnet)
   Write-Host "   - Clearing associations on subnet ${rg}/${vnet}/${subnet}"
@@ -153,25 +246,6 @@ function Delete-PrivateEndpoints-For-Subnet {
       try { az resource delete --ids $pe | Out-Null } catch { Write-Host "       (warn) failed: $pe" -ForegroundColor DarkYellow }
     }
   }
-}
-
-function Delete-ServiceAssociationLinks {
-  param($rg, $vnet, $subnet)
-  $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
-  if (-not $salIds) { return $true }  # nothing to do
-
-  # SAL precisa da delegação ACA presente para ser removido
-  Ensure-ACA-Delegation -rg $rg -vnet $vnet -subnet $subnet
-
-  $ok = Delete-SALs-CLI -salIds $salIds
-  if (-not $ok) {
-    Write-Host "     (warn) Some SALs remain on ${rg}/${vnet}/${subnet}. Skipping subnet cleanup for now." -ForegroundColor DarkYellow
-    return $false
-  }
-
-  # Confirma que acabou
-  $left = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
-  return (-not $left)
 }
 
 function Remove-VNet-Peerings {
@@ -199,7 +273,8 @@ function Remove-PrivateDns-VNetLinks {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     $parts = $line -split "\t"
     if ($parts.Count -lt 2) { continue }
-    $zName = $parts[0]; $zRg = $parts[1]
+    $zName = $parts[0]
+    $zRg   = $parts[1]
 
     try {
       $linksRaw = az network private-dns link vnet list -g $zRg -z $zName --query "[?virtualNetwork.id=='$targetVNetId'].{id:id,name:name}" -o tsv
@@ -213,7 +288,9 @@ function Remove-PrivateDns-VNetLinks {
       if (-not $lname) { continue }
 
       Write-Host "   - Deleting Private DNS VNet link: $zRg/$zName/$lname"
-      try { az network private-dns link vnet delete -g $zRg -z $zName -n $lname --yes | Out-Null } catch {
+      try {
+        az network private-dns link vnet delete -g $zRg -z $zName -n $lname --yes | Out-Null
+      } catch {
         Write-Host "     (warn) could not delete DNS link $lname" -ForegroundColor DarkYellow
       }
     }
@@ -251,7 +328,9 @@ function Broad-Disassociate-NSG {
         foreach ($S in ($subsRaw -split "`n")) {
           if ([string]::IsNullOrWhiteSpace($S)) { continue }
           Write-Host "   - Disassociating NSG from subnet ${VNET_RG}/${VNET_NAME}/${S}"
-          try { az network vnet subnet update -g $VNET_RG --vnet-name $VNET_NAME -n $S --remove networkSecurityGroup | Out-Null } catch {
+          try {
+            az network vnet subnet update -g $VNET_RG --vnet-name $VNET_NAME -n $S --remove networkSecurityGroup | Out-Null
+          } catch {
             Write-Host "     (warn) subnet update failed: ${VNET_RG}/${VNET_NAME}/${S}" -ForegroundColor DarkYellow
           }
         }
@@ -260,7 +339,7 @@ function Broad-Disassociate-NSG {
   }
 }
 
-# ---------- Heavy resource cleanup ----------
+# -------------------- Heavy resource cleanup --------------------
 function Delete-ContainerApps-In-RG {
   param($rg)
   Write-Host ">> Deleting Container Apps in '$rg'…"
@@ -272,6 +351,7 @@ function Delete-ContainerApps-In-RG {
     }
   }
 }
+
 function Delete-ManagedEnvironments-In-RG {
   param($rg)
   Write-Host ">> Deleting Container Apps managed environments in '$rg'…"
@@ -283,6 +363,7 @@ function Delete-ManagedEnvironments-In-RG {
     }
   }
 }
+
 function Delete-ApplicationGateways-In-RG {
   param($rg)
   Write-Host ">> Deleting Application Gateways in '$rg'…"
@@ -294,6 +375,7 @@ function Delete-ApplicationGateways-In-RG {
     }
   }
 }
+
 function Delete-AzureFirewalls-In-RG {
   param($rg)
   Write-Host ">> Deleting Azure Firewalls in '$rg'…"
@@ -305,6 +387,7 @@ function Delete-AzureFirewalls-In-RG {
     }
   }
 }
+
 function Delete-Bastions-In-RG {
   param($rg)
   Write-Host ">> Deleting Bastion hosts in '$rg'…"
@@ -316,6 +399,7 @@ function Delete-Bastions-In-RG {
     }
   }
 }
+
 function Delete-VMs-And-NICs-In-RG {
   param($rg)
   Write-Host ">> Deleting VMs and leftover NICs in '$rg'…"
@@ -336,12 +420,12 @@ function Delete-VMs-And-NICs-In-RG {
   }
 }
 
-# ---------- Main VNet breaker ----------
+# -------------------- Main VNet breaker --------------------
 function Break-VNet-Blockers-In-RG {
   param($rg)
   Write-Host ">> Breaking VNet/Subnet blockers in '$rg'…"
 
-  # 0) Proativo – remove recursos que ancoram subnets
+  # 0) Proactively delete resources that anchor subnets
   Delete-ContainerApps-In-RG       -rg $rg
   Delete-ManagedEnvironments-In-RG -rg $rg
   Delete-ApplicationGateways-In-RG -rg $rg
@@ -349,7 +433,7 @@ function Break-VNet-Blockers-In-RG {
   Delete-Bastions-In-RG            -rg $rg
   Delete-VMs-And-NICs-In-RG        -rg $rg
 
-  # 1) Itera VNets/subnets, apaga SAL antes de limpar delegations, depois tenta deletar
+  # 1) Iterate VNets and subnets to clear remaining blockers and delete
   try { $vnetNamesRaw = az network vnet list -g $rg --query "[].name" -o tsv } catch { $vnetNamesRaw = '' }
   if ($vnetNamesRaw) {
     $vnetNames = $vnetNamesRaw -split "`n"
@@ -364,27 +448,33 @@ function Break-VNet-Blockers-In-RG {
           $accountId = (az account show --query id -o tsv).Trim()
           $SUBNET_ID = "/subscriptions/$accountId/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET/subnets/$S"
 
-          # a) PEs
+          # a) Private Endpoints on this subnet
           Delete-PrivateEndpoints-For-Subnet -subnetId $SUBNET_ID
-          # b) SALs (precisa sair antes de remover delegations)
+
+          # b) Delete any cross-RG ACA Managed Environments that still reference this subnet (best-effort)
+          Delete-ACAEnvs-Referencing-Subnet -subnetId $SUBNET_ID
+
+          # c) Delete SALs before removing delegations (must succeed, or skip this subnet)
           $salCleared = Delete-ServiceAssociationLinks -rg $rg -vnet $VNET -subnet $S
           if (-not $salCleared) {
             Write-Host "     (info) Deferring ${rg}/${VNET}/${S} until SALs are gone." -ForegroundColor DarkYellow
             continue
           }
-          # c) Agora pode limpar props (inclui delegations)
+
+          # d) Now it’s safe to clear subnet associations (including delegations)
           Unset-Subnet-Props -rg $rg -vnet $VNET -subnet $S
-          # d) Deleta a subnet
+
+          # e) Delete the subnet
           az network vnet subnet delete -g $rg --vnet-name $VNET -n $S | Out-Null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "   - Deleted subnet ${rg}/${VNET}/$S"
           } else {
-            Write-Host "     (info) subnet delete deferred: ${rg}/${VNET}/$S" -ForegroundColor DarkYellow
+            Write-Host "     (info) Subnet delete deferred: ${rg}/${VNET}/$S" -ForegroundColor DarkYellow
           }
         }
       }
 
-      # e) Peerings e DNS links, depois tenta deletar a VNet
+      # f) Remove peerings and DNS links, then try to delete the VNet
       Remove-VNet-Peerings -rg $rg
       $acct = (az account show --query id -o tsv).Trim()
       $vnetId = "/subscriptions/$acct/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET"
@@ -400,7 +490,7 @@ function Break-VNet-Blockers-In-RG {
   }
 }
 
-# ---------- Main ----------
+# -------------------- Main --------------------
 function Main {
   Prompt-Context
 
