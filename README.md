@@ -21,7 +21,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubus
 
 ### 🔑 Fetch a Dapr token for local/dev — `ps/get-dapr-token.ps1`
 
-Pulls a Dapr API token so you can quickly wire up local or dev services.
+Pulls a Container App Dapr API token so you can quickly wire up local or dev services.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/get-dapr-token.ps1').Content"
