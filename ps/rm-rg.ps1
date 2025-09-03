@@ -4,7 +4,8 @@ Script: rm-rg.ps1
 Overview:
     Safely and forcefully deletes an Azure Resource Group by removing common blockers first.
     Handles: NSG disassociations (NICs/subnets), Private Endpoints on subnets, Service Association Links (e.g., for Azure Container Apps),
-    subnet delegations/service endpoints/route tables/NAT gateways, VNet peerings, Private DNS zone VNet links, and resource group locks.
+    subnet delegations/service endpoints/route tables/NAT gateways, VNet peerings, Private DNS zone VNet links, resource group locks,
+    plus "heavy" blockers: Container Apps, Managed Environments, Application Gateways, Azure Firewalls, Bastion, VMs/NICs.
     Triggers `az group delete --no-wait` and optionally polls until the RG is gone or a rollback is detected.
 
 Prerequisites:
@@ -28,7 +29,7 @@ Usage examples:
 
 Notes:
     - Polling stops when the RG is no longer returned (Deleted). If Azure reports Deleting and later Succeeded, the script exits early
-        indicating deletion likely failed due to blockers.
+      indicating deletion likely failed due to blockers.
     - Exit codes: 1 (input/validation), 2 (delete command failed), 3 (timeout), 4 (rollback to Succeeded after Deleting).
 #>
 param(
@@ -102,6 +103,13 @@ function Delete-PrivateEndpoints-For-Subnet {
     }
 }
 
+function Force-Delete-SAL {
+    param($salId)
+    Write-Host "   - Force-deleting SAL via REST: $salId"
+    $uri = "https://management.azure.com$salId?api-version=2023-09-01"
+    try { & az rest --method delete --uri $uri | Out-Null } catch { Write-Host "     (warn) REST SAL delete failed: $salId" -ForegroundColor DarkYellow }
+}
+
 function Delete-ServiceAssociationLinks {
     param($rg, $vnet, $subnet)
     # First delete the SAL child resources under the subnet
@@ -110,9 +118,11 @@ function Delete-ServiceAssociationLinks {
         foreach ($sid in ($salIds -split "`n")) {
             if ([string]::IsNullOrWhiteSpace($sid)) { continue }
             Write-Host "   - Deleting Service Association Link: $sid"
-            # Use az resource delete; check exit code instead of relying on exceptions
             & az resource delete --ids $sid | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-Host "     (warn) failed to delete SAL: $sid" -ForegroundColor DarkYellow }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "     (warn) failed to delete SAL: $sid" -ForegroundColor DarkYellow
+                Force-Delete-SAL -salId $sid
+            }
         }
     }
 }
@@ -186,9 +196,87 @@ function Broad-Disassociate-NSG {
     }
 }
 
+function Delete-ContainerApps-In-RG {
+    param($rg)
+    Write-Host ">> Deleting Container Apps in '$rg'…"
+    try { $ids = & az resource list -g $rg --resource-type Microsoft.App/containerApps --query "[].id" -o tsv } catch { $ids = '' }
+    foreach ($id in ($ids -split "`n")) { if ($id) {
+        Write-Host "   - Deleting CA: $id"
+        try { & az resource delete --ids $id | Out-Null } catch { Write-Host "     (warn) failed: $id" -ForegroundColor DarkYellow }
+    } }
+}
+
+function Delete-ManagedEnvironments-In-RG {
+    param($rg)
+    Write-Host ">> Deleting Container Apps managed environments (capability hosts) in '$rg'…"
+    try { $ids = & az resource list -g $rg --resource-type Microsoft.App/managedEnvironments --query "[].id" -o tsv } catch { $ids = '' }
+    foreach ($id in ($ids -split "`n")) { if ($id) {
+        Write-Host "   - Deleting ME: $id"
+        try { & az resource delete --ids $id | Out-Null } catch { Write-Host "     (warn) failed: $id" -ForegroundColor DarkYellow }
+    } }
+}
+
+function Delete-ApplicationGateways-In-RG {
+    param($rg)
+    Write-Host ">> Deleting Application Gateways in '$rg'…"
+    try { $ids = & az network application-gateway list -g $rg --query "[].id" -o tsv } catch { $ids = '' }
+    foreach ($id in ($ids -split "`n")) { if ($id) {
+        Write-Host "   - Deleting AGW: $id"
+        try { & az resource delete --ids $id | Out-Null } catch { Write-Host "     (warn) failed: $id" -ForegroundColor DarkYellow }
+    } }
+}
+
+function Delete-AzureFirewalls-In-RG {
+    param($rg)
+    Write-Host ">> Deleting Azure Firewalls in '$rg'…"
+    try { $ids = & az network firewall list -g $rg --query "[].id" -o tsv } catch { $ids = '' }
+    foreach ($id in ($ids -split "`n")) { if ($id) {
+        Write-Host "   - Deleting AFW: $id"
+        try { & az resource delete --ids $id | Out-Null } catch { Write-Host "     (warn) failed: $id" -ForegroundColor DarkYellow }
+    } }
+}
+
+function Delete-Bastions-In-RG {
+    param($rg)
+    Write-Host ">> Deleting Bastion hosts in '$rg'…"
+    try { $ids = & az network bastion list -g $rg --query "[].id" -o tsv } catch { $ids = '' }
+    foreach ($id in ($ids -split "`n")) { if ($id) {
+        Write-Host "   - Deleting Bastion: $id"
+        try { & az resource delete --ids $id | Out-Null } catch { Write-Host "     (warn) failed: $id" -ForegroundColor DarkYellow }
+    } }
+}
+
+function Delete-VMs-And-NICs-In-RG {
+    param($rg)
+    Write-Host ">> Deleting VMs and leftover NICs in '$rg'…"
+    try { $vmIds = & az vm list -g $rg --query "[].id" -o tsv } catch { $vmIds = '' }
+    foreach ($id in ($vmIds -split "`n")) { if ($id) {
+        Write-Host "   - Deleting VM: $id"
+        try { & az vm delete --ids $id --yes | Out-Null } catch { Write-Host "     (warn) failed: $id" -ForegroundColor DarkYellow }
+    } }
+
+    # After VMs go, NICs may still linger; remove unattached NICs
+    Start-Sleep -Seconds 10
+    try { $nicIds = & az network nic list -g $rg --query "[?virtualMachine==null].id" -o tsv } catch { $nicIds = '' }
+    foreach ($id in ($nicIds -split "`n")) { if ($id) {
+        Write-Host "   - Deleting NIC: $id"
+        try { & az resource delete --ids $id | Out-Null } catch { Write-Host "     (warn) failed: $id" -ForegroundColor DarkYellow }
+    } }
+}
+
 function Break-VNet-Blockers-In-RG {
     param($rg)
     Write-Host ">> Breaking VNet/Subnet blockers in '$rg'…"
+
+    # 0) Proactively delete resources that anchor subnets
+    Delete-ContainerApps-In-RG      -rg $rg
+    Delete-ManagedEnvironments-In-RG -rg $rg
+    Delete-ApplicationGateways-In-RG -rg $rg
+    Delete-AzureFirewalls-In-RG      -rg $rg
+    Delete-Bastions-In-RG            -rg $rg
+    Delete-VMs-And-NICs-In-RG        -rg $rg
+
+    # 1) Iterate VNets and subnets to clear remaining blockers and delete
     try { $vnetNamesRaw = & az network vnet list -g $rg --query "[].name" -o tsv } catch { $vnetNamesRaw = '' }
     if ($vnetNamesRaw) {
         $vnetNames = $vnetNamesRaw -split "`n"
@@ -200,24 +288,35 @@ function Break-VNet-Blockers-In-RG {
                     if ([string]::IsNullOrWhiteSpace($S)) { continue }
                     $accountId = (& az account show --query id -o tsv).Trim()
                     $SUBNET_ID = "/subscriptions/$accountId/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET/subnets/$S"
-            # 1) Delete PEs on subnet (independent)
-            Delete-PrivateEndpoints-For-Subnet -subnetId $SUBNET_ID
-            # 2) Delete SALs before removing delegations (avoids SubnetMissingRequiredDelegation)
-            Delete-ServiceAssociationLinks -rg $rg -vnet $VNET -subnet $S
-            # 3) Now clear subnet associations (including delegations)
-            Unset-Subnet-Props -rg $rg -vnet $VNET -subnet $S
-            # 4) Try to delete the subnet now that blockers are cleared
-            & az network vnet subnet delete -g $rg --vnet-name $VNET -n $S | Out-Null
-            if ($LASTEXITCODE -eq 0) { Write-Host "   - Deleted subnet ${rg}/${VNET}/$S" } else { Write-Host "     (info) subnet delete deferred: ${rg}/${VNET}/$S" -ForegroundColor DarkYellow }
+
+                    # a) Delete PEs on subnet (independent)
+                    Delete-PrivateEndpoints-For-Subnet -subnetId $SUBNET_ID
+                    # b) Delete SALs before removing delegations (avoids SubnetMissingRequiredDelegation)
+                    Delete-ServiceAssociationLinks -rg $rg -vnet $VNET -subnet $S
+                    # c) Now clear subnet associations (including delegations)
+                    Unset-Subnet-Props -rg $rg -vnet $VNET -subnet $S
+                    # d) Try to delete the subnet now that blockers are cleared
+                    & az network vnet subnet delete -g $rg --vnet-name $VNET -n $S | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "   - Deleted subnet ${rg}/${VNET}/$S"
+                    } else {
+                        Write-Host "     (info) subnet delete deferred: ${rg}/${VNET}/$S" -ForegroundColor DarkYellow
+                    }
                 }
             }
+
+            # e) Remove peerings and DNS links, then try to delete the VNet
             Remove-VNet-Peerings -rg $rg
             $acct = (& az account show --query id -o tsv).Trim()
             $vnetId = "/subscriptions/$acct/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET"
             Remove-PrivateDns-VNetLinks -targetVNetId $vnetId
-            # Attempt to delete the VNet itself
-        & az network vnet delete -g $rg -n $VNET | Out-Null
-        if ($LASTEXITCODE -eq 0) { Write-Host ">> Deleted VNet ${rg}/${VNET}" } else { Write-Host "   (info) VNet delete deferred: ${rg}/${VNET}" -ForegroundColor DarkYellow }
+
+            & az network vnet delete -g $rg -n $VNET | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host ">> Deleted VNet ${rg}/${VNET}"
+            } else {
+                Write-Host "   (info) VNet delete deferred: ${rg}/${VNET}" -ForegroundColor DarkYellow
+            }
         }
     }
 }
@@ -233,7 +332,11 @@ function Main {
 
     Write-Host ">> Removing locks in RG (if any)…"
     try { $locks = & az lock list --resource-group $script:RG --query "[].id" -o tsv } catch { $locks = '' }
-    if ($locks) { foreach ($L in ($locks -split "`n")) { if ($L) { try { & az lock delete --ids $L | Out-Null } catch { Write-Host "(warn) could not delete RG lock $L" -ForegroundColor DarkYellow } } } }
+    if ($locks) {
+        foreach ($L in ($locks -split "`n")) {
+            if ($L) { try { & az lock delete --ids $L | Out-Null } catch { Write-Host "(warn) could not delete RG lock $L" -ForegroundColor DarkYellow } }
+        }
+    }
 
     Write-Host ">> Enumerating NSGs in '$script:RG'…"
     try { $nsgsRaw = & az network nsg list -g $script:RG --query "[].id" -o tsv } catch { $nsgsRaw = '' }
@@ -244,30 +347,57 @@ function Main {
         Write-Host ">> Processing NSG: $NSG_NAME"
 
         try { $rgNicsRaw = & az network nic list -g $script:RG --query "[?networkSecurityGroup && networkSecurityGroup.id=='$NSG_ID'].name" -o tsv } catch { $rgNicsRaw = '' }
-        if ($rgNicsRaw) { foreach ($nic in ($rgNicsRaw -split "`n")) { if ($nic) { Write-Host "   - Removing NSG from NIC $script:RG/$nic"; try { & az network nic update -g $script:RG -n $nic --remove networkSecurityGroup | Out-Null } catch { Write-Host "     (warn) failed NIC update $nic" -ForegroundColor DarkYellow } } } }
+        if ($rgNicsRaw) {
+            foreach ($nic in ($rgNicsRaw -split "`n")) {
+                if ($nic) {
+                    Write-Host "   - Removing NSG from NIC $script:RG/$nic"
+                    try { & az network nic update -g $script:RG -n $nic --remove networkSecurityGroup | Out-Null } catch { Write-Host "     (warn) failed NIC update $nic" -ForegroundColor DarkYellow }
+                }
+            }
+        }
 
         try { $vnetsRaw = & az network vnet list -g $script:RG --query "[].name" -o tsv } catch { $vnetsRaw = '' }
         if ($vnetsRaw) {
             foreach ($VNET in ($vnetsRaw -split "`n")) {
                 if (-not $VNET) { continue }
                 try { $subsRaw = & az network vnet subnet list -g $script:RG --vnet-name $VNET --query "[?networkSecurityGroup && networkSecurityGroup.id=='$NSG_ID'].name" -o tsv } catch { $subsRaw = '' }
-                if ($subsRaw) { foreach ($S in ($subsRaw -split "`n")) { if ($S) { Write-Host "   - Disassociating NSG from subnet ${script:RG}/${VNET}/$S"; try { & az network vnet subnet update -g $script:RG --vnet-name $VNET -n $S --remove networkSecurityGroup | Out-Null } catch { Write-Host "     (warn) subnet update failed $S" -ForegroundColor DarkYellow } } } }
+                if ($subsRaw) {
+                    foreach ($S in ($subsRaw -split "`n")) {
+                        if ($S) {
+                            Write-Host "   - Disassociating NSG from subnet ${script:RG}/${VNET}/$S"
+                            try { & az network vnet subnet update -g $script:RG --vnet-name $VNET -n $S --remove networkSecurityGroup | Out-Null } catch { Write-Host "     (warn) subnet update failed $S" -ForegroundColor DarkYellow }
+                        }
+                    }
+                }
             }
         }
 
-        try { & az network nsg delete --ids $NSG_ID | Out-Null } catch { Write-Host "!! NSG delete failed; performing broad disassociation & retrying…"; Broad-Disassociate-NSG -NSG_ID $NSG_ID; try { & az network nsg delete --ids $NSG_ID | Out-Null } catch { Write-Host "!! Final NSG delete failed: $NSG_ID" -ForegroundColor Red } }
+        try {
+            & az network nsg delete --ids $NSG_ID | Out-Null
+        } catch {
+            Write-Host "!! NSG delete failed; performing broad disassociation & retrying…"
+            Broad-Disassociate-NSG -NSG_ID $NSG_ID
+            try { & az network nsg delete --ids $NSG_ID | Out-Null } catch { Write-Host "!! Final NSG delete failed: $NSG_ID" -ForegroundColor Red }
+        }
     }
 
     Break-VNet-Blockers-In-RG -rg $script:RG
 
     Write-Host ">> Final lock cleanup at RG level…"
     try { $locks2 = & az lock list --resource-group $script:RG --query "[].id" -o tsv } catch { $locks2 = '' }
-    if ($locks2) { foreach ($L2 in ($locks2 -split "`n")) { if ($L2) { try { & az lock delete --ids $L2 | Out-Null } catch { Write-Host "(warn) could not delete RG lock $L2" -ForegroundColor DarkYellow } } } }
+    if ($locks2) {
+        foreach ($L2 in ($locks2 -split "`n")) {
+            if ($L2) { try { & az lock delete --ids $L2 | Out-Null } catch { Write-Host "(warn) could not delete RG lock $L2" -ForegroundColor DarkYellow } }
+        }
+    }
 
     if ($Confirm -and -not $Force) {
         Write-Host
         $sure = Read-Host "About to DELETE resource group '$script:RG'. Are you sure? [y/N]"
-        if (-not ($sure.ToLower() -in @('y','yes'))) { Write-Host 'Aborted before deleting the resource group.'; return }
+        if (-not ($sure.ToLower() -in @('y','yes'))) {
+            Write-Host 'Aborted before deleting the resource group.'
+            return
+        }
     }
 
     Write-Host ">> Deleting resource group '$script:RG'…"
