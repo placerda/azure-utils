@@ -51,6 +51,52 @@ $script:RG  = $null
 # State file in system temp directory
 $StateFile = Join-Path $env:TEMP 'cleanup-nsgs-last.ps1'
 
+function Get-Subnet-SAL-Ids {
+    param($rg, $vnet, $subnet)
+    try {
+        az network vnet subnet show -g $rg --vnet-name $vnet -n $subnet --query "serviceAssociationLinks[].id" -o tsv
+    } catch { '' }
+}
+
+function Ensure-ACA-Delegation {
+    param($rg, $vnet, $subnet)
+    try {
+        $has = az network vnet subnet show -g $rg --vnet-name $vnet -n $subnet --query "length(delegations[?serviceName=='Microsoft.App/environments'])" -o tsv
+    } catch { $has = '0' }
+    if ($has -eq '0') {
+        Write-Host "   - Adding delegation Microsoft.App/environments on ${rg}/${vnet}/${subnet}"
+        az network vnet subnet update -g $rg --vnet-name $vnet -n $subnet --delegations Microsoft.App/environments | Out-Null
+    }
+}
+
+function Delete-SALs-CLI {
+    param($salIds)
+    $ok = $true
+    foreach ($sid in ($salIds -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($sid)) { continue }
+        Write-Host "   - Deleting Service Association Link (CLI): $sid"
+        # Retry a few times to ride out eventual consistency
+        $tries = 0
+        do {
+            try {
+                az resource delete --ids $sid --api-version 2023-09-01 | Out-Null
+                $rc = $LASTEXITCODE
+            } catch {
+                $rc = 1
+            }
+            if ($rc -ne 0) { Start-Sleep -Seconds 5 }
+            $tries++
+        } while ($rc -ne 0 -and $tries -lt 5)
+
+        if ($rc -ne 0) {
+            Write-Host "     (error) SAL delete failed (CLI) for $sid" -ForegroundColor Red
+            $ok = $false
+        }
+    }
+    return $ok
+}
+
+
 function Prompt-Context {
     if (Test-Path -Path $StateFile) {
         . $StateFile
@@ -124,22 +170,25 @@ function Force-Delete-SAL {
 
 function Delete-ServiceAssociationLinks {
     param($rg, $vnet, $subnet)
-    try {
-        $salIds = az network vnet subnet show -g $rg --vnet-name $vnet -n $subnet --query "serviceAssociationLinks[].id" -o tsv
-    } catch { $salIds = '' }
+    $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
+    if (-not $salIds) { return $true }  # nothing to do
 
-    if ($salIds) {
-        foreach ($sid in ($salIds -split "`n")) {
-            if ([string]::IsNullOrWhiteSpace($sid)) { continue }
-            Write-Host "   - Deleting Service Association Link: $sid"
-            az resource delete --ids $sid | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "     (warn) failed to delete SAL: $sid" -ForegroundColor DarkYellow
-                Force-Delete-SAL -salId $sid
-            }
-        }
+    # SAL requires the ACA delegation to exist while deleting
+    Ensure-ACA-Delegation -rg $rg -vnet $vnet -subnet $subnet
+
+    $ok = Delete-SALs-CLI -salIds $salIds
+
+    if (-not $ok) {
+        Write-Host "     (warn) Some SALs remain on ${rg}/${vnet}/${subnet}. Skipping subnet cleanup for now." -ForegroundColor DarkYellow
+        return $false
     }
+
+    # Re-check to confirm
+    $left = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
+    return (-not $left)
 }
+
+
 
 function Remove-VNet-Peerings {
     param($rg)
@@ -357,11 +406,17 @@ function Break-VNet-Blockers-In-RG {
 
                     # a) Delete PEs on subnet (independent)
                     Delete-PrivateEndpoints-For-Subnet -subnetId $SUBNET_ID
-                    # b) Delete SALs before removing delegations (avoids SubnetMissingRequiredDelegation)
-                    Delete-ServiceAssociationLinks -rg $rg -vnet $VNET -subnet $S
-                    # c) Now clear subnet associations (including delegations)
+                    # b) Delete SALs before removing delegations (must succeed, otherwise bail on this subnet)
+                    $salCleared = Delete-ServiceAssociationLinks -rg $rg -vnet $VNET -subnet $S
+                    if (-not $salCleared) {
+                        Write-Host "     (info) Deferring ${rg}/${VNET}/${S} until SALs are gone." -ForegroundColor DarkYellow
+                        continue
+                    }
+                    
+                    # c) Now it’s safe to clear subnet associations (including delegations)
                     Unset-Subnet-Props -rg $rg -vnet $VNET -subnet $S
-                    # d) Try to delete the subnet now that blockers are cleared
+                    
+                    # d) Delete the subnet
                     az network vnet subnet delete -g $rg --vnet-name $VNET -n $S | Out-Null
                     if ($LASTEXITCODE -eq 0) {
                         Write-Host "   - Deleted subnet ${rg}/${VNET}/$S"
