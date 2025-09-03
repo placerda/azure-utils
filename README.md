@@ -7,6 +7,8 @@ Each script comes with a one-liner you can copy, paste, and run instantly.
 - Azure CLI (`az`) installed and logged in: `az login`
 - Permissions to manage the target resources
 - **PowerShell 7+ (`pwsh`)**
+- Enable preview versions of az cli extensions: `az config set extension.dynamic_install_allow_preview=true`
+
 
 ## Quick Start
 > **Note**  
