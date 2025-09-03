@@ -33,6 +33,16 @@ Notes:
       indicating deletion likely failed due to blockers.
     - Exit codes: 1 (input/validation), 2 (delete command failed), 3 (timeout), 4 (rollback to Succeeded after Deleting).
 #>
+
+# Relaunch in pwsh if running under Windows PowerShell
+if ($PSVersionTable.PSEdition -ne 'Core') {
+  $url = 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/rm-rg.ps1'
+  $tmp = Join-Path $env:TEMP "rm-rg-$([guid]::NewGuid()).ps1"
+  Invoke-WebRequest -UseBasicParsing $url -OutFile $tmp
+  & pwsh -NoProfile -ExecutionPolicy Bypass -File $tmp @PSBoundParameters
+  exit $LASTEXITCODE
+}
+
 param(
     [switch]$Force,
     [switch]$NoWait,
@@ -75,16 +85,22 @@ function Delete-SALs-CLI {
     foreach ($sid in ($salIds -split "`n")) {
         if ([string]::IsNullOrWhiteSpace($sid)) { continue }
         Write-Host "   - Deleting Service Association Link (CLI): $sid"
-        # Retry a few times to ride out eventual consistency
+
+        # Retry up to 5 times; the 5th (final) attempt is verbose
         $tries = 0
         do {
             try {
-                az resource delete --ids $sid --api-version 2023-09-01 | Out-Null
+                if ($tries -eq 4) {
+                    Write-Host "     · final attempt with --verbose"
+                    az resource delete --ids $sid --api-version 2023-09-01 --verbose
+                } else {
+                    az resource delete --ids $sid --api-version 2023-09-01 --only-show-errors | Out-Null
+                }
                 $rc = $LASTEXITCODE
             } catch {
                 $rc = 1
             }
-            if ($rc -ne 0) { Start-Sleep -Seconds 5 }
+            if ($rc -ne 0 -and $tries -lt 4) { Start-Sleep -Seconds 5 }  # no sleep after final attempt
             $tries++
         } while ($rc -ne 0 -and $tries -lt 5)
 
@@ -95,6 +111,7 @@ function Delete-SALs-CLI {
     }
     return $ok
 }
+
 
 
 function Prompt-Context {
