@@ -7,11 +7,14 @@ Each script comes with a one-liner you can copy, paste, and run instantly.
 - Azure CLI (`az`) installed and logged in: `az login`
 - Permissions to manage the target resources
 - **PowerShell 7+ (`pwsh`)**
-- Enable preview versions of az cli extensions: `az config set extension.dynamic_install_allow_preview=true`
+- Azure CLI extensions configured to allow preview versions and install without prompts:
+ ```
+  az config set extension.dynamic_install_allow_preview=true
+  az config set extension.use_dynamic_install=yes_without_prompt
+```
 
-
-## Quick Start
-> **Note**  
+## Copy & Run
+> [!Tip]  
 > Just copy the command below each script and run it in your PowerShell 7 terminal.
 
 ### 🌐 Enable public access in a Resource Group — `ps/set-public.ps1`
