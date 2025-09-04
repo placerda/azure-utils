@@ -111,12 +111,8 @@ function Delete-SALs-AzPS {
   param($salIds, [string]$subscriptionId)
   Ensure-AzModules
   try {
-    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
-      Connect-AzAccount | Out-Null
-    }
-    if ($subscriptionId) {
-      Select-AzSubscription -SubscriptionId $subscriptionId | Out-Null
-    }
+    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) { Connect-AzAccount | Out-Null }
+    if ($subscriptionId) { Select-AzSubscription -SubscriptionId $subscriptionId | Out-Null }
   } catch {
     Write-Host "   (warn) Az login/subscription selection failed; continuing best-effort." -ForegroundColor DarkYellow
   }
@@ -125,18 +121,27 @@ function Delete-SALs-AzPS {
   foreach ($sid in ($salIds -split "`n")) {
     if ([string]::IsNullOrWhiteSpace($sid)) { continue }
     Write-Host "   - [Az] Removing SAL: $sid"
-    $apis = @('2024-03-01','2023-09-01')
+
     $deleted = $false
-    foreach ($api in $apis) {
+    foreach ($api in @('2024-03-01','2023-09-01')) {
       try {
         Remove-AzResource -ResourceId $sid -ApiVersion $api -Force -Confirm:$false -ErrorAction Stop
         $deleted = $true; break
-      } catch {
-        Start-Sleep 3
+      } catch { Start-Sleep 2 }
+    }
+
+    if (-not $deleted) {
+      # Final try: direct REST with Az token (still not the CLI app)
+      foreach ($api in @('2024-03-01','2023-09-01')) {
+        try {
+          Invoke-AzRestMethod -Method DELETE -Path "$sid?api-version=$api" -ErrorAction Stop | Out-Null
+          $deleted = $true; break
+        } catch { Start-Sleep 2 }
       }
     }
+
     if (-not $deleted) {
-      Write-Host "     (error) [Az] Remove failed: $sid" -ForegroundColor Red
+      Write-Host "     (error) [Az] SAL delete failed: $sid" -ForegroundColor Red
       $ok = $false
     }
   }
@@ -411,7 +416,7 @@ function Delete-VMs-And-NICs-In-RG {
     }
   }
   Start-Sleep -Seconds 10
-  try { $nicIds = az network nic list -g $rg --query "[?virtualMachine==null].id" -o tsv } catch { $nicIds = '' }
+  try { $nicIds = az network nic list -g $rg --query "[?virtualMachine==null && privateEndpoint==null].id" -o tsv } catch { $nicIds = '' }
   foreach ($id in ($nicIds -split "`n")) {
     if (-not [string]::IsNullOrWhiteSpace($id)) {
       Write-Host "   - Deleting NIC: $id"
