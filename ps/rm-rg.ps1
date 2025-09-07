@@ -116,22 +116,10 @@ function Delete-SALs-AzPS {
     [string]$subscriptionId,
     [string]$tenantId
   )
-  Ensure-AzModules
-  try {
-    # Make sure we’re authenticated in the right tenant/context
-    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
-      if (-not $tenantId -or $tenantId.Trim() -eq '') {
-        $tenantId = (az account show --query tenantId -o tsv 2>$null).Trim()
-      }
-      Write-Host "   - [Az] Signing in to tenant $tenantId (device code) ..."
-      Connect-AzAccount -TenantId $tenantId -UseDeviceAuthentication | Out-Null
-    } else {
-      if ($tenantId) { Set-AzContext -Tenant $tenantId | Out-Null }
-    }
-    if ($subscriptionId) { Select-AzSubscription -SubscriptionId $subscriptionId | Out-Null }
-  } catch {
-    Write-Host "   (warn) Az login/subscription selection failed; continuing best-effort." -ForegroundColor DarkYellow
-  }
+
+  # Ensure Az context is valid for this tenant/subscription
+  $okCtx = Ensure-Az-Tenant-Context -SubscriptionId $subscriptionId -TenantId $tenantId
+  if (-not $okCtx) { return $false }
 
   $ok = $true
   foreach ($sid in ($salIds -split "`n")) {
@@ -165,6 +153,7 @@ function Delete-SALs-AzPS {
 
 
 
+
 function Delete-ACAEnvs-Referencing-Subnet {
   param($subnetId)
   # Cross-RG cleanup: remove any ACA Managed Environments that still point at this subnet
@@ -184,28 +173,34 @@ function Delete-ACAEnvs-Referencing-Subnet {
 
 function Delete-ServiceAssociationLinks {
   param($rg, $vnet, $subnet)
-  $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
-  if (-not $salIds) { return $true }
 
+  $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
+  if (-not $salIds) { return $true }  # Nothing to do
+
+  # SAL requires ACA delegation while deleting
   Ensure-ACA-Delegation -rg $rg -vnet $vnet -subnet $subnet
 
+  # Fast path: CLI
   $ok = Delete-SALs-CLI -salIds $salIds
-  if (-not $ok) {
-    Write-Host "     (info) CLI failed (tenant may block the Azure CLI app). Trying Az PowerShell fallback…"
-    $subId    = (az account show --query id -o tsv 2>$null).Trim()
-    $tenantId = if ($script:TENANT) { $script:TENANT } else { (az account show --query tenantId -o tsv 2>$null).Trim() }
-    $ok = Delete-SALs-AzPS -salIds $salIds -subscriptionId $subId -tenantId $tenantId
+  if ($ok) {
+    if (Wait-SAL-Gone -rg $rg -vnet $vnet -subnet $subnet -maxSeconds 180) { return $true }
   }
 
+  # Fallback: Az PowerShell (works when CLI app is blocked by CA)
+  Write-Host "     (info) CLI failed or SALs still present. Trying Az PowerShell fallback…"
+  $subId    = (az account show --query id -o tsv 2>$null).Trim()
+  $tenantId = if ($script:TENANT) { $script:TENANT } else { (az account show --query tenantId -o tsv 2>$null).Trim() }
 
-  if (-not $ok) {
-    Write-Host "     (warn) Some SALs remain; cannot proceed clearing delegations on ${rg}/${vnet}/${subnet}." -ForegroundColor DarkYellow
-    return $false
+  $ok = Delete-SALs-AzPS -salIds $salIds -subscriptionId $subId -tenantId $tenantId
+
+  if ($ok -and (Wait-SAL-Gone -rg $rg -vnet $vnet -subnet $subnet -maxSeconds 240)) {
+    return $true
   }
 
-  $left = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
-  return (-not $left)
+  Write-Host "     (warn) Some SALs remain; cannot proceed clearing delegations on ${rg}/${vnet}/${subnet}." -ForegroundColor DarkYellow
+  return $false
 }
+
 
 # -------------------- Prompt --------------------
 function Prompt-Context {
@@ -456,6 +451,81 @@ function Delete-VMs-And-NICs-In-RG {
   }
 }
 
+function Ensure-Az-Tenant-Context {
+  param(
+    [string]$SubscriptionId,
+    [string]$TenantId
+  )
+  Ensure-AzModules
+
+  # Resolve tenant deterministically
+  $resolvedTenant = $TenantId
+  if (-not $resolvedTenant -or $resolvedTenant.Trim() -eq '') {
+    try { $resolvedTenant = (az account show --query tenantId -o tsv 2>$null).Trim() } catch { $resolvedTenant = '' }
+  }
+  if (-not $resolvedTenant) {
+    Write-Host "   (error) Could not resolve tenantId for Az fallback." -ForegroundColor Red
+    return $false
+  }
+
+  try {
+    $ctx = Get-AzContext -ErrorAction SilentlyContinue
+    if (-not $ctx -or $ctx.Tenant.Id -ne $resolvedTenant) {
+      Write-Host "   - [Az] Signing in to tenant $resolvedTenant (device code) ..." -ForegroundColor Cyan
+      Connect-AzAccount -TenantId $resolvedTenant -UseDeviceAuthentication | Out-Null
+    } else {
+      # Ensure exact tenant is active
+      Set-AzContext -Tenant $resolvedTenant | Out-Null
+    }
+    if ($SubscriptionId) { Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null }
+    return $true
+  } catch {
+    Write-Host "   (warn) Az sign-in failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    return $false
+  }
+}
+
+function Wait-SAL-Gone {
+  param(
+    [string]$rg, [string]$vnet, [string]$subnet,
+    [int]$maxSeconds = 180, [int]$pollSeconds = 6
+  )
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($sw.Elapsed.TotalSeconds -lt $maxSeconds) {
+    try {
+      $left = az network vnet subnet show -g $rg --vnet-name $vnet -n $subnet `
+              --query "length(serviceAssociationLinks)" -o tsv 2>$null
+      if (-not $left -or [int]$left -eq 0) { return $true }
+    } catch { return $true } # If the subnet is gone or not returned, treat as success
+    Start-Sleep -Seconds $pollSeconds
+  }
+  return $false
+}
+
+function Detach-VNet-DdosPlan {
+  param($rg, $vnet)
+  try {
+    az network vnet show -g $rg -n $vnet --query "ddosProtectionPlan.id" -o tsv | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      az network vnet update -g $rg -n $vnet --remove ddosProtectionPlan | Out-Null
+      Write-Host "   - Detached DDoS plan from ${rg}/${vnet}"
+    }
+  } catch { }
+}
+
+function Try-Delete-VNet {
+  param($rg, $vnet, [int]$attempts = 6)
+  for ($i = 0; $i -lt $attempts; $i++) {
+    az network vnet delete -g $rg -n $vnet | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host ">> Deleted VNet ${rg}/${vnet}"; return $true }
+    # First time it fails, try detaching DDoS; subsequent tries just back off
+    if ($i -eq 0) { Detach-VNet-DdosPlan -rg $rg -vnet $vnet }
+    Start-Sleep -Seconds ([int][math]::Pow(2, $i) * 5)  # 5,10,20,40,80,160
+  }
+  return $false
+}
+
+
 # -------------------- Main VNet breaker --------------------
 function Break-VNet-Blockers-In-RG {
   param($rg)
@@ -469,57 +539,69 @@ function Break-VNet-Blockers-In-RG {
   Delete-Bastions-In-RG            -rg $rg
   Delete-VMs-And-NICs-In-RG        -rg $rg
 
-  # 1) Iterate VNets and subnets to clear remaining blockers and delete
+  # 1) Iterate VNets and subnets to clear remaining blockers and delete (multi-pass)
   try { $vnetNamesRaw = az network vnet list -g $rg --query "[].name" -o tsv } catch { $vnetNamesRaw = '' }
   if ($vnetNamesRaw) {
     $vnetNames = $vnetNamesRaw -split "`n"
+
     foreach ($VNET in $vnetNames) {
       if ([string]::IsNullOrWhiteSpace($VNET)) { continue }
 
-      try { $subsRaw = az network vnet subnet list -g $rg --vnet-name $VNET --query "[].name" -o tsv } catch { $subsRaw = '' }
-      if ($subsRaw) {
-        foreach ($S in ($subsRaw -split "`n")) {
-          if ([string]::IsNullOrWhiteSpace($S)) { continue }
+      # Multi-pass over subnets in this VNet
+      $passes = 0
+      do {
+        $passes++
+        $deferred = @()
 
-          $accountId = (az account show --query id -o tsv).Trim()
-          $SUBNET_ID = "/subscriptions/$accountId/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET/subnets/$S"
+        try { $subsRaw = az network vnet subnet list -g $rg --vnet-name $VNET --query "[].name" -o tsv } catch { $subsRaw = '' }
+        if ($subsRaw) {
+          foreach ($S in ($subsRaw -split "`n")) {
+            if ([string]::IsNullOrWhiteSpace($S)) { continue }
 
-          # a) Private Endpoints on this subnet
-          Delete-PrivateEndpoints-For-Subnet -subnetId $SUBNET_ID
+            $accountId = (az account show --query id -o tsv).Trim()
+            $SUBNET_ID = "/subscriptions/$accountId/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET/subnets/$S"
 
-          # b) Delete any cross-RG ACA Managed Environments that still reference this subnet (best-effort)
-          Delete-ACAEnvs-Referencing-Subnet -subnetId $SUBNET_ID
+            # a) Private Endpoints on this subnet
+            Delete-PrivateEndpoints-For-Subnet -subnetId $SUBNET_ID
 
-          # c) Delete SALs before removing delegations (must succeed, or skip this subnet)
-          $salCleared = Delete-ServiceAssociationLinks -rg $rg -vnet $VNET -subnet $S
-          if (-not $salCleared) {
-            Write-Host "     (info) Deferring ${rg}/${VNET}/${S} until SALs are gone." -ForegroundColor DarkYellow
-            continue
-          }
+            # b) Delete any cross-RG ACA Managed Environments that still reference this subnet (best-effort)
+            Delete-ACAEnvs-Referencing-Subnet -subnetId $SUBNET_ID
 
-          # d) Now it’s safe to clear subnet associations (including delegations)
-          Unset-Subnet-Props -rg $rg -vnet $VNET -subnet $S
+            # c) Delete SALs before removing delegations (must succeed, or skip this subnet)
+            $salCleared = Delete-ServiceAssociationLinks -rg $rg -vnet $VNET -subnet $S
+            if (-not $salCleared) {
+              Write-Host "     (info) Deferring ${rg}/${VNET}/${S} until SALs are gone." -ForegroundColor DarkYellow
+              $deferred += $S
+              continue
+            }
 
-          # e) Delete the subnet
-          az network vnet subnet delete -g $rg --vnet-name $VNET -n $S | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "   - Deleted subnet ${rg}/${VNET}/$S"
-          } else {
-            Write-Host "     (info) Subnet delete deferred: ${rg}/${VNET}/$S" -ForegroundColor DarkYellow
+            # d) Now it’s safe to clear subnet associations (including delegations)
+            Unset-Subnet-Props -rg $rg -vnet $VNET -subnet $S
+
+            # e) Delete the subnet
+            az network vnet subnet delete -g $rg --vnet-name $VNET -n $S | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "   - Deleted subnet ${rg}/${VNET}/$S"
+            } else {
+              Write-Host "     (info) Subnet delete deferred: ${rg}/${VNET}/$S" -ForegroundColor DarkYellow
+              $deferred += $S
+            }
           }
         }
-      }
 
-      # f) Remove peerings and DNS links, then try to delete the VNet
+        if ($deferred.Count -gt 0 -and $passes -lt 4) {
+          Write-Host "   - Waiting before next subnet pass (remaining: $($deferred -join ', '))..."
+          Start-Sleep -Seconds (10 * $passes)  # 10s, 20s, 30s
+        }
+      } while ($deferred.Count -gt 0 -and $passes -lt 4)
+
+      # f) Remove peerings and DNS links, then try to delete the VNet with backoff
       Remove-VNet-Peerings -rg $rg
-      $acct = (az account show --query id -o tsv).Trim()
+      $acct  = (az account show --query id -o tsv).Trim()
       $vnetId = "/subscriptions/$acct/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET"
       Remove-PrivateDns-VNetLinks -targetVNetId $vnetId
 
-      az network vnet delete -g $rg -n $VNET | Out-Null
-      if ($LASTEXITCODE -eq 0) {
-        Write-Host ">> Deleted VNet ${rg}/${VNET}"
-      } else {
+      if (-not (Try-Delete-VNet -rg $rg -vnet $VNET)) {
         Write-Host "   (info) VNet delete deferred: ${rg}/${VNET}" -ForegroundColor DarkYellow
       }
     }
@@ -544,6 +626,17 @@ function Main {
       "`$TENANT = '$safeTenant'"
     ) -Encoding UTF8
   }
+
+  # Pre-warm Az context so SAL fallback has a valid token (single device-code prompt)
+  try {
+    $subId    = (az account show --query id -o tsv 2>$null).Trim()
+    $tenantId = $script:TENANT
+    if (-not $tenantId -or $tenantId.Trim() -eq '') {
+      try { $tenantId = (az account show --query tenantId -o tsv 2>$null).Trim() } catch { $tenantId = '' }
+    }
+    [void](Ensure-Az-Tenant-Context -SubscriptionId $subId -TenantId $tenantId)
+  } catch { }
+
 
   Write-Host ">> Verifying resource group '$script:RG' exists…"
   try { az group show -n $script:RG | Out-Null } catch {
