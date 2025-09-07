@@ -17,6 +17,7 @@ param(
   [switch]$Force,
   [switch]$NoWait,
   [switch]$Confirm,
+  [switch]$AllowAzInteractiveLogin,
   [int]$TimeoutMinutes = 20,
   [int]$PollSeconds = 10,
   [string]$TenantId  
@@ -118,7 +119,7 @@ function Delete-SALs-AzPS {
   )
 
   # Ensure Az context is valid for this tenant/subscription
-  $okCtx = Ensure-Az-Tenant-Context -SubscriptionId $subscriptionId -TenantId $tenantId
+  $okCtx = Ensure-Az-Tenant-Context -SubscriptionId $subscriptionId -TenantId $tenantId -AllowInteractive:$AllowAzInteractiveLogin
   if (-not $okCtx) { return $false }
 
   $ok = $true
@@ -454,11 +455,12 @@ function Delete-VMs-And-NICs-In-RG {
 function Ensure-Az-Tenant-Context {
   param(
     [string]$SubscriptionId,
-    [string]$TenantId
+    [string]$TenantId,
+    [switch]$AllowInteractive
   )
   Ensure-AzModules
 
-  # Resolve o tenant de forma determinística
+  # Resolve tenantId
   $resolvedTenant = $TenantId
   if (-not $resolvedTenant -or $resolvedTenant.Trim() -eq '') {
     try { $resolvedTenant = (az account show --query tenantId -o tsv 2>$null).Trim() } catch { $resolvedTenant = '' }
@@ -468,42 +470,59 @@ function Ensure-Az-Tenant-Context {
     return $false
   }
 
-  # Se já existe contexto no mesmo tenant, só seleciona a subscription e segue
+  # 1) Tenta REUTILIZAR contexto já existente (silencioso)
   try {
-    $ctx = Get-AzContext -ErrorAction SilentlyContinue
-    if ($ctx -and $ctx.Tenant.Id -eq $resolvedTenant) {
+    $all = Get-AzContext -ListAvailable -ErrorAction SilentlyContinue
+    $match = $null
+    if ($all) {
+      if ($SubscriptionId) {
+        $match = $all | Where-Object { $_.Tenant.Id -eq $resolvedTenant -and $_.Subscription.Id -eq $SubscriptionId } | Select-Object -First 1
+      }
+      if (-not $match) {
+        $match = $all | Where-Object { $_.Tenant.Id -eq $resolvedTenant } | Select-Object -First 1
+      }
+    }
+    if ($match) {
+      Set-AzContext -Context $match | Out-Null
       if ($SubscriptionId) { Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null }
       return $true
     }
   } catch { }
 
-  # Habilita WAM só neste processo → tenta SSO silencioso com cache da conta
-  try { Update-AzConfig -EnableLoginByWam $true -Scope Process | Out-Null } catch { }
+  # 2) NÃO interagir? então NÃO loga. Retorna false com instrução clara.
+  if (-not $AllowInteractive) {
+    Write-Host "   (warn) Az PowerShell is not signed in for tenant $resolvedTenant." -ForegroundColor DarkYellow
+    Write-Host "         Your tenant blocks Azure CLI for SAL delete. To proceed WITHOUT prompts next time:" -ForegroundColor DarkYellow
+    Write-Host "           - Run once:  Connect-AzAccount -TenantId $resolvedTenant" -ForegroundColor DarkYellow
+    Write-Host "         Or run this script with -AllowAzInteractiveLogin to authorize now." -ForegroundColor DarkYellow
+    return $false
+  }
 
-  # Tenta pegar seu UPN do az (para evitar o "escolha uma conta")
+  # 3) Interação permitida ⇒ tenta WAM/SSO; se falhar, cai para device code
+  try { Update-AzConfig -EnableLoginByWam $true -Scope Process | Out-Null } catch { }
   $accountId = $null
   try {
     $candidate = (az account show --query user.name -o tsv 2>$null).Trim()
     if ($candidate -and ($candidate -like '*@*')) { $accountId = $candidate }
   } catch { }
 
-  # 1ª tentativa: SSO silencioso com WAM (sem prompt). 2ª: device code.
   try {
     if ($accountId) {
       Write-Host "   - [Az] Signing in to tenant $resolvedTenant (WAM/SSO, account: $accountId) ..." -ForegroundColor Cyan
-      Connect-AzAccount -TenantId $resolvedTenant -AccountId $accountId -UseDeviceAuthentication -ErrorAction Stop | Out-Null
+      Connect-AzAccount -TenantId $resolvedTenant -AccountId $accountId -ErrorAction Stop | Out-Null
     } else {
       Write-Host "   - [Az] Signing in to tenant $resolvedTenant (WAM/SSO) ..." -ForegroundColor Cyan
-      Connect-AzAccount -TenantId $resolvedTenant -UseDeviceAuthentication -ErrorAction Stop | Out-Null
+      Connect-AzAccount -TenantId $resolvedTenant -ErrorAction Stop | Out-Null
     }
   } catch {
-    Write-Host "   (info) Silent sign-in failed; falling back to device code…" -ForegroundColor DarkYellow
+    Write-Host "   (info) WAM/SSO not available; falling back to device code…" -ForegroundColor DarkYellow
     Connect-AzAccount -TenantId $resolvedTenant -UseDeviceCode | Out-Null
   }
 
   if ($SubscriptionId) { Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null }
   return $true
 }
+
 
 
 function Wait-SAL-Gone {
@@ -648,15 +667,16 @@ function Main {
     ) -Encoding UTF8
   }
 
-  # Pre-warm Az context so SAL fallback has a valid token (single device-code prompt)
+  # Pre-warm Az context 
   try {
     $subId    = (az account show --query id -o tsv 2>$null).Trim()
     $tenantId = $script:TENANT
     if (-not $tenantId -or $tenantId.Trim() -eq '') {
       try { $tenantId = (az account show --query tenantId -o tsv 2>$null).Trim() } catch { $tenantId = '' }
     }
-    [void](Ensure-Az-Tenant-Context -SubscriptionId $subId -TenantId $tenantId)
+    [void](Ensure-Az-Tenant-Context -SubscriptionId $subId -TenantId $tenantId -AllowInteractive:$AllowAzInteractiveLogin)
   } catch { }
+
 
 
   Write-Host ">> Verifying resource group '$script:RG' exists…"
