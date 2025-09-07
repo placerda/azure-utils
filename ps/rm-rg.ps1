@@ -18,8 +18,10 @@ param(
   [switch]$NoWait,
   [switch]$Confirm,
   [int]$TimeoutMinutes = 20,
-  [int]$PollSeconds = 10
+  [int]$PollSeconds = 10,
+  [string]$TenantId  
 )
+
 
 # Relaunch in pwsh if running under Windows PowerShell (non-Core)
 if ($PSVersionTable.PSEdition -ne 'Core') {
@@ -36,6 +38,7 @@ $ErrorActionPreference = 'Stop'
 # Globals
 $script:SUB = $null
 $script:RG  = $null
+$script:TENANT = $null
 
 # State file (remember last subscription/RG)
 $StateFile = Join-Path $env:TEMP 'cleanup-nsgs-last.ps1'
@@ -108,10 +111,23 @@ function Ensure-AzModules {
 }
 
 function Delete-SALs-AzPS {
-  param($salIds, [string]$subscriptionId)
+  param(
+    $salIds,
+    [string]$subscriptionId,
+    [string]$tenantId
+  )
   Ensure-AzModules
   try {
-    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) { Connect-AzAccount | Out-Null }
+    # Make sure we’re authenticated in the right tenant/context
+    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
+      if (-not $tenantId -or $tenantId.Trim() -eq '') {
+        $tenantId = (az account show --query tenantId -o tsv 2>$null).Trim()
+      }
+      Write-Host "   - [Az] Signing in to tenant $tenantId (device code) ..."
+      Connect-AzAccount -TenantId $tenantId -UseDeviceAuthentication | Out-Null
+    } else {
+      if ($tenantId) { Set-AzContext -Tenant $tenantId | Out-Null }
+    }
     if ($subscriptionId) { Select-AzSubscription -SubscriptionId $subscriptionId | Out-Null }
   } catch {
     Write-Host "   (warn) Az login/subscription selection failed; continuing best-effort." -ForegroundColor DarkYellow
@@ -131,7 +147,6 @@ function Delete-SALs-AzPS {
     }
 
     if (-not $deleted) {
-      # Final try: direct REST with Az token (still not the CLI app)
       foreach ($api in @('2024-03-01','2023-09-01')) {
         try {
           Invoke-AzRestMethod -Method DELETE -Path "$sid?api-version=$api" -ErrorAction Stop | Out-Null
@@ -147,6 +162,8 @@ function Delete-SALs-AzPS {
   }
   return $ok
 }
+
+
 
 function Delete-ACAEnvs-Referencing-Subnet {
   param($subnetId)
@@ -168,27 +185,24 @@ function Delete-ACAEnvs-Referencing-Subnet {
 function Delete-ServiceAssociationLinks {
   param($rg, $vnet, $subnet)
   $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
-  if (-not $salIds) { return $true }  # nothing to do
+  if (-not $salIds) { return $true }
 
-  # SAL requires the ACA delegation to exist while deleting
   Ensure-ACA-Delegation -rg $rg -vnet $vnet -subnet $subnet
 
-  # First try with Azure CLI (fast path)
   $ok = Delete-SALs-CLI -salIds $salIds
-
-  # If CLI fails (e.g., tenant blocks Azure CLI app), fallback to Az PowerShell
   if (-not $ok) {
     Write-Host "     (info) CLI failed (tenant may block the Azure CLI app). Trying Az PowerShell fallback…"
-    $subId = (az account show --query id -o tsv 2>$null).Trim()
-    $ok = Delete-SALs-AzPS -salIds $salIds -subscriptionId $subId
+    $subId    = (az account show --query id -o tsv 2>$null).Trim()
+    $tenantId = if ($script:TENANT) { $script:TENANT } else { (az account show --query tenantId -o tsv 2>$null).Trim() }
+    $ok = Delete-SALs-AzPS -salIds $salIds -subscriptionId $subId -tenantId $tenantId
   }
+
 
   if (-not $ok) {
     Write-Host "     (warn) Some SALs remain; cannot proceed clearing delegations on ${rg}/${vnet}/${subnet}." -ForegroundColor DarkYellow
     return $false
   }
 
-  # Double-check
   $left = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
   return (-not $left)
 }
@@ -197,12 +211,17 @@ function Delete-ServiceAssociationLinks {
 function Prompt-Context {
   if (Test-Path -Path $StateFile) {
     . $StateFile
-    $script:SUB = $SUB; $script:RG = $RG
+    $script:SUB    = $SUB
+    $script:RG     = $RG
+    $script:TENANT = $TENANT
+
     Write-Host "Last used:" -ForegroundColor Cyan
-    $subDisplay = if ([string]::IsNullOrWhiteSpace($script:SUB)) { '<none>' } else { $script:SUB }
-    $rgDisplay  = if ([string]::IsNullOrWhiteSpace($script:RG))  { '<none>' } else { $script:RG }
+    $subDisplay    = if ([string]::IsNullOrWhiteSpace($script:SUB))    { '<none>' } else { $script:SUB }
+    $rgDisplay     = if ([string]::IsNullOrWhiteSpace($script:RG))     { '<none>' } else { $script:RG }
+    $tenantDisplay = if ([string]::IsNullOrWhiteSpace($script:TENANT)) { '<auto-from-subscription>' } else { $script:TENANT }
     Write-Host "  Subscription: $subDisplay"
     Write-Host "  ResourceGroup: $rgDisplay"
+    Write-Host "  Tenant: $tenantDisplay"
 
     $reuseSub = Read-Host "Reuse subscription '$script:SUB'? [Y/n]"
     if ([string]::IsNullOrWhiteSpace($reuseSub)) { $reuseSub = 'Y' }
@@ -211,10 +230,15 @@ function Prompt-Context {
     $reuseRG = Read-Host "Reuse resource group '$script:RG'? [Y/n]"
     if ([string]::IsNullOrWhiteSpace($reuseRG)) { $reuseRG = 'Y' }
     if ($reuseRG -match '^(n|no)$') { $script:RG = Read-Host 'Resource group name' }
+
+    $reuseTenant = Read-Host "Reuse tenant '$tenantDisplay'? [Y/n] (blank = auto-detect from subscription)"
+    if ([string]::IsNullOrWhiteSpace($reuseTenant)) { $reuseTenant = 'Y' }
+    if ($reuseTenant -match '^(n|no)$') { $script:TENANT = Read-Host 'Tenant ID or domain (blank = auto)' }
   }
   else {
-    $script:SUB = Read-Host 'Subscription ID or name'
-    $script:RG  = Read-Host 'Resource group name'
+    $script:SUB    = Read-Host 'Subscription ID or name'
+    $script:RG     = Read-Host 'Resource group name'
+    $script:TENANT = Read-Host 'Tenant ID or domain (blank = auto)'
   }
 
   if ([string]::IsNullOrWhiteSpace($script:SUB) -or [string]::IsNullOrWhiteSpace($script:RG)) {
@@ -222,10 +246,17 @@ function Prompt-Context {
     exit 1
   }
 
-  $safeSub = $script:SUB -replace "'","''"
-  $safeRg  = $script:RG  -replace "'","''"
-  Set-Content -Path $StateFile -Value @("`$SUB = '$safeSub'","`$RG  = '$safeRg'") -Encoding UTF8
+  # Save initial state (tenant may be blank; we’ll auto-fill after az account set)
+  $safeSub    = $script:SUB -replace "'","''"
+  $safeRg     = $script:RG  -replace "'","''"
+  $safeTenant = if ($script:TENANT) { $script:TENANT -replace "'","''" } else { '' }
+  Set-Content -Path $StateFile -Value @(
+    "`$SUB = '$safeSub'",
+    "`$RG  = '$safeRg'",
+    "`$TENANT = '$safeTenant'"
+  ) -Encoding UTF8
 }
+
 
 # -------------------- Network helpers --------------------
 function Unset-Subnet-Props {
@@ -501,6 +532,18 @@ function Main {
 
   Write-Host ">> Using subscription: $script:SUB"
   az account set --subscription $script:SUB | Out-Null
+  # If tenant was left blank, derive it from the current az context and persist
+  if ([string]::IsNullOrWhiteSpace($script:TENANT)) {
+    try { $script:TENANT = (az account show --query tenantId -o tsv 2>$null).Trim() } catch { $script:TENANT = '' }
+    $safeSub    = $script:SUB -replace "'","''"
+    $safeRg     = $script:RG  -replace "'","''"
+    $safeTenant = $script:TENANT -replace "'","''"
+    Set-Content -Path $StateFile -Value @(
+      "`$SUB = '$safeSub'",
+      "`$RG  = '$safeRg'",
+      "`$TENANT = '$safeTenant'"
+    ) -Encoding UTF8
+  }
 
   Write-Host ">> Verifying resource group '$script:RG' exists…"
   try { az group show -n $script:RG | Out-Null } catch {
