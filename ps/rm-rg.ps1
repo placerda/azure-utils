@@ -458,7 +458,7 @@ function Ensure-Az-Tenant-Context {
   )
   Ensure-AzModules
 
-  # Resolve tenant deterministically
+  # Resolve o tenant de forma determinística
   $resolvedTenant = $TenantId
   if (-not $resolvedTenant -or $resolvedTenant.Trim() -eq '') {
     try { $resolvedTenant = (az account show --query tenantId -o tsv 2>$null).Trim() } catch { $resolvedTenant = '' }
@@ -468,22 +468,43 @@ function Ensure-Az-Tenant-Context {
     return $false
   }
 
+  # Se já existe contexto no mesmo tenant, só seleciona a subscription e segue
   try {
     $ctx = Get-AzContext -ErrorAction SilentlyContinue
-    if (-not $ctx -or $ctx.Tenant.Id -ne $resolvedTenant) {
-      Write-Host "   - [Az] Signing in to tenant $resolvedTenant (device code) ..." -ForegroundColor Cyan
-      Connect-AzAccount -TenantId $resolvedTenant -UseDeviceAuthentication | Out-Null
-    } else {
-      # Ensure exact tenant is active
-      Set-AzContext -Tenant $resolvedTenant | Out-Null
+    if ($ctx -and $ctx.Tenant.Id -eq $resolvedTenant) {
+      if ($SubscriptionId) { Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null }
+      return $true
     }
-    if ($SubscriptionId) { Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null }
-    return $true
+  } catch { }
+
+  # Habilita WAM só neste processo → tenta SSO silencioso com cache da conta
+  try { Update-AzConfig -EnableLoginByWam $true -Scope Process | Out-Null } catch { }
+
+  # Tenta pegar seu UPN do az (para evitar o "escolha uma conta")
+  $accountId = $null
+  try {
+    $candidate = (az account show --query user.name -o tsv 2>$null).Trim()
+    if ($candidate -and ($candidate -like '*@*')) { $accountId = $candidate }
+  } catch { }
+
+  # 1ª tentativa: SSO silencioso com WAM (sem prompt). 2ª: device code.
+  try {
+    if ($accountId) {
+      Write-Host "   - [Az] Signing in to tenant $resolvedTenant (WAM/SSO, account: $accountId) ..." -ForegroundColor Cyan
+      Connect-AzAccount -TenantId $resolvedTenant -AccountId $accountId -UseDeviceAuthentication -ErrorAction Stop | Out-Null
+    } else {
+      Write-Host "   - [Az] Signing in to tenant $resolvedTenant (WAM/SSO) ..." -ForegroundColor Cyan
+      Connect-AzAccount -TenantId $resolvedTenant -UseDeviceAuthentication -ErrorAction Stop | Out-Null
+    }
   } catch {
-    Write-Host "   (warn) Az sign-in failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
-    return $false
+    Write-Host "   (info) Silent sign-in failed; falling back to device code…" -ForegroundColor DarkYellow
+    Connect-AzAccount -TenantId $resolvedTenant -UseDeviceCode | Out-Null
   }
+
+  if ($SubscriptionId) { Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null }
+  return $true
 }
+
 
 function Wait-SAL-Gone {
   param(
