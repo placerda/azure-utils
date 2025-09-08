@@ -1,4 +1,4 @@
-.local
+.local/
 
 # Ignore compiled bash scripts (if any)
 *.shc

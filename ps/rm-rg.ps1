@@ -20,7 +20,18 @@ param(
   [switch]$AllowAzInteractiveLogin,
   [int]$TimeoutMinutes = 20,
   [int]$PollSeconds = 10,
-  [string]$TenantId  
+  [string]$TenantId,
+  # Optional service principal (workaround for Conditional Access blocking public client ID 04b07795-8ddb-461a-bbee-02f9e1bf7b46)
+  [string]$SpClientId,
+  [string]$SpClientSecret,
+  [string]$SpTenantId,
+  # Alternative secret sourcing
+  [string]$SpClientSecretFile,
+  [switch]$PromptSpSecret,
+  # Control Az PowerShell fallback verbosity/behavior
+  [switch]$SilentAzWarnings,
+  [switch]$SkipAzFallback,
+  [switch]$ForceSAL
 )
 
 
@@ -50,6 +61,69 @@ function Get-Subnet-SAL-Ids {
   try {
     az network vnet subnet show -g $rg --vnet-name $vnet -n $subnet --query "serviceAssociationLinks[].id" -o tsv
   } catch { '' }
+}
+
+# Retrieve detailed info for a SAL (serviceAssociationLink) returning a hashtable
+function Get-SAL-Detail {
+  param([string]$salId)
+  if (-not $salId) { return $null }
+  $apis = @('2024-03-01','2023-09-01')
+  foreach ($api in $apis) {
+    try {
+      $json = az rest --method get --url "https://management.azure.com$salId?api-version=$api" -o json 2>$null
+      if ($LASTEXITCODE -eq 0 -and $json) {
+        return ($json | ConvertFrom-Json)
+      }
+    } catch { }
+  }
+  return $null
+}
+
+# Ensure required CLI extensions are present (best-effort, idempotent)
+function Ensure-Cli-Extensions {
+  param([string[]]$names)
+  foreach ($n in $names) {
+    if ([string]::IsNullOrWhiteSpace($n)) { continue }
+    try {
+      $present = az extension list --query "[?name=='$n'] | length(@)" -o tsv 2>$null
+    } catch { $present = '0' }
+    if ($present -ne '0') { continue }
+    Write-Host "   - Installing CLI extension: $n" -ForegroundColor DarkCyan
+    try { az extension add --name $n --only-show-errors | Out-Null } catch { Write-Host "     (warn) could not add extension $n" -ForegroundColor DarkYellow }
+  }
+}
+
+# DevCenter targeted cleanup for subnet references (order: environments -> projects -> network connections -> devcenters)
+function Remove-DevCenter-Resources-For-Subnet {
+  param([string]$subnetId)
+  if (-not $subnetId) { return }
+  Ensure-Cli-Extensions -names @('devcenter')
+
+  Write-Host "   - [DevCenter] Locating resources referencing subnet..."
+
+  # Helper to delete a list of resource ids generically
+  function _DelIds { param([string[]]$ids,[string]$label)
+    foreach ($id in ($ids | Where-Object { $_ })) {
+      Write-Host "     · Deleting ${label}: $id"
+      try { az resource delete --ids $id | Out-Null } catch { Write-Host "       (warn) failed ${label}: $id" -ForegroundColor DarkYellow }
+    }
+  }
+
+  # 1) Environments
+  try { $envs = az resource list --query "[?type=='Microsoft.DevCenter/devcenters/projects/environments' && contains(to_string(properties),'$subnetId')].id" -o tsv } catch { $envs = '' }
+  _DelIds -ids ($envs -split "`n") -label 'Dev Environment'
+
+  # 2) Projects (after environments gone)
+  try { $projects = az resource list --query "[?type=='Microsoft.DevCenter/devcenters/projects' && contains(to_string(properties),'$subnetId')].id" -o tsv } catch { $projects = '' }
+  _DelIds -ids ($projects -split "`n") -label 'DevCenter Project'
+
+  # 3) Network Connections (they contain the subnetId directly)
+  try { $netConns = az resource list --query "[?type=='Microsoft.DevCenter/networkConnections' && contains(to_string(properties),'$subnetId')].id" -o tsv } catch { $netConns = '' }
+  _DelIds -ids ($netConns -split "`n") -label 'Network Connection'
+
+  # 4) DevCenters referencing those network connections (broad search)
+  try { $devcenters = az resource list --query "[?type=='Microsoft.DevCenter/devcenters' && contains(to_string(properties),'Microsoft.DevCenter/networkConnections') && contains(to_string(properties),'$subnetId')].id" -o tsv } catch { $devcenters = '' }
+  _DelIds -ids ($devcenters -split "`n") -label 'DevCenter'
 }
 
 function Ensure-ACA-Delegation {
@@ -159,8 +233,7 @@ function Delete-ACAEnvs-Referencing-Subnet {
   param($subnetId)
   # Cross-RG cleanup: remove any ACA Managed Environments that still point at this subnet
   try {
-    $ids = az resource list --resource-type Microsoft.App/managedEnvironments `
-      --query "[?properties.vnetConfiguration.infrastructureSubnetId=='$subnetId'].id" -o tsv
+  $ids = az resource list --resource-type Microsoft.App/managedEnvironments --query "[?properties.vnetConfiguration.infrastructureSubnetId=='$subnetId'].id" -o tsv
   } catch { $ids = '' }
   foreach ($id in ($ids -split "`n")) {
     if ($id) {
@@ -172,11 +245,75 @@ function Delete-ACAEnvs-Referencing-Subnet {
   }
 }
 
+function Delete-Subnet-Consumers-Broad {
+  param([string]$subnetId)
+
+  Write-Host "   - Scanning for resources that reference this subnet (DevCenter/DevOpsInfra/ConnectedEnv/ASE/Batch)…"
+
+  # 1) consultas focadas (rápidas)
+  $queries = @(
+    "[?type=='Microsoft.App/connectedEnvironments' && contains(to_string(properties),'$subnetId')].id",
+    "[?starts_with(type,'Microsoft.DevCenter/') && contains(to_string(properties),'$subnetId')].id",
+    "[?starts_with(type,'Microsoft.DevOpsInfrastructure/') && contains(to_string(properties),'$subnetId')].id",
+    "[?type=='Microsoft.Web/hostingEnvironments' && contains(to_string(properties),'$subnetId')].id",
+    "[?type=='Microsoft.Batch/batchAccounts/pools' && contains(to_string(properties),'$subnetId')].id"
+  )
+
+  $refIds = @()
+  foreach ($q in $queries) {
+    try {
+      $ids = az resource list --query $q -o tsv
+      if ($ids) { $refIds += ($ids -split "`n") }
+    } catch { }
+  }
+
+  $refIds = $refIds | Where-Object { $_ } | Sort-Object -Unique
+  foreach ($rid in $refIds) {
+    Write-Host "     · Deleting referencing resource: $rid"
+    try { az resource delete --ids $rid | Out-Null } catch {
+      Write-Host "       (warn) couldn't delete: $rid" -ForegroundColor DarkYellow
+    }
+  }
+
+  # 2) polling leve até nada mais referenciar o subnet
+  $deadline = [DateTime]::UtcNow.AddMinutes(5)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    try {
+      $still = az resource list --query "[?contains(to_string(properties),'$subnetId') && (starts_with(type,'Microsoft.DevCenter/') || starts_with(type,'Microsoft.DevOpsInfrastructure/') || type=='Microsoft.App/connectedEnvironments' || type=='Microsoft.Web/hostingEnvironments' || type=='Microsoft.Batch/batchAccounts/pools')].id" -o tsv
+    } catch { $still = '' }
+    if (-not $still) { break }
+    Start-Sleep -Seconds 10
+  }
+}
+
+
 function Delete-ServiceAssociationLinks {
   param($rg, $vnet, $subnet)
 
   $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
   if (-not $salIds) { return $true }  # Nothing to do
+
+  # Detect SAL owners (DevCenter vs ACA) for targeted cleanup
+  $acctId = (az account show --query id -o tsv 2>$null).Trim()
+  $subnetIdFull = "/subscriptions/$acctId/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$vnet/subnets/$subnet"
+
+  $needsDevCenterCleanup = $false
+  foreach ($sid in ($salIds -split "`n")) {
+    if (-not $sid) { continue }
+    $detail = Get-SAL-Detail -salId $sid
+    if ($detail -and $detail.properties.serviceName -match 'Microsoft\.DevCenter/networkConnections') {
+      $needsDevCenterCleanup = $true
+      break
+    }
+  }
+
+  if ($needsDevCenterCleanup) {
+    Write-Host "   - SAL indicates DevCenter network connection; performing DevCenter dependency cleanup first..." -ForegroundColor Cyan
+    Remove-DevCenter-Resources-For-Subnet -subnetId $subnetIdFull
+    # Re-evaluate SAL IDs in case some were removed by cleanup
+    $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
+    if (-not $salIds) { return $true }
+  }
 
   # SAL requires ACA delegation while deleting
   Ensure-ACA-Delegation -rg $rg -vnet $vnet -subnet $subnet
@@ -199,6 +336,31 @@ function Delete-ServiceAssociationLinks {
   }
 
   Write-Host "     (warn) Some SALs remain; cannot proceed clearing delegations on ${rg}/${vnet}/${subnet}." -ForegroundColor DarkYellow
+  # Dump SAL details to aid troubleshooting / support escalation
+  foreach ($sid in ($salIds -split "`n")) {
+    if (-not $sid) { continue }
+    $detail = Get-SAL-Detail -salId $sid
+    if ($detail) {
+      $svc = $detail.properties.serviceName
+      $ownId = $detail.properties.ownerResourceId
+      Write-Host "       · SAL detail: serviceName=$svc ownerResourceId=$ownId" -ForegroundColor DarkYellow
+    } else {
+      Write-Host "       · SAL detail fetch failed for $sid" -ForegroundColor DarkYellow
+    }
+  }
+  Write-Host "     (hint) If serviceName indicates Microsoft.DevCenter/networkConnections and deletion keeps failing with UnauthorizedClientApplication, create a temporary service principal with Owner role and re-run using -SpClientId/-SpClientSecret." -ForegroundColor DarkYellow
+  if ($ForceSAL) {
+    Write-Host "     (info) ForceSAL enabled: attempting raw DELETE via az rest..." -ForegroundColor Cyan
+    foreach ($sid in ($salIds -split "`n")) {
+      if (-not $sid) { continue }
+      foreach ($api in @('2024-03-01','2023-09-01')) {
+        Write-Host "       · REST DELETE $api $sid" -ForegroundColor DarkCyan
+        try { az rest --method delete --url "https://management.azure.com$sid?api-version=$api" --only-show-errors | Out-Null } catch { }
+        Start-Sleep 1
+      }
+    }
+    if (Wait-SAL-Gone -rg $rg -vnet $vnet -subnet $subnet -maxSeconds 60) { return $true }
+  }
   return $false
 }
 
@@ -533,8 +695,7 @@ function Wait-SAL-Gone {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   while ($sw.Elapsed.TotalSeconds -lt $maxSeconds) {
     try {
-      $left = az network vnet subnet show -g $rg --vnet-name $vnet -n $subnet `
-              --query "length(serviceAssociationLinks)" -o tsv 2>$null
+  $left = az network vnet subnet show -g $rg --vnet-name $vnet -n $subnet --query "length(serviceAssociationLinks)" -o tsv 2>$null
       if (-not $left -or [int]$left -eq 0) { return $true }
     } catch { return $true } # If the subnet is gone or not returned, treat as success
     Start-Sleep -Seconds $pollSeconds
@@ -601,6 +762,9 @@ function Break-VNet-Blockers-In-RG {
             $accountId = (az account show --query id -o tsv).Trim()
             $SUBNET_ID = "/subscriptions/$accountId/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/$VNET/subnets/$S"
 
+            # a0) Kill known consumers that reference THIS subnet (cross-RG, same subscription)
+            Delete-Subnet-Consumers-Broad -subnetId $SUBNET_ID
+
             # a) Private Endpoints on this subnet
             Delete-PrivateEndpoints-For-Subnet -subnetId $SUBNET_ID
 
@@ -653,6 +817,43 @@ function Main {
   Prompt-Context
 
   Write-Host ">> Using subscription: $script:SUB"
+  # If service principal parameters provided (or via env vars) perform SP login first to bypass CA restrictions
+  if (-not $SpClientId -and $env:AZ_SUBDEL_SP_CLIENT_ID) { $SpClientId = $env:AZ_SUBDEL_SP_CLIENT_ID }
+  if (-not $SpClientSecret -and $env:AZ_SUBDEL_SP_CLIENT_SECRET) { $SpClientSecret = $env:AZ_SUBDEL_SP_CLIENT_SECRET }
+  if (-not $SpTenantId -and $env:AZ_SUBDEL_SP_TENANT_ID) { $SpTenantId = $env:AZ_SUBDEL_SP_TENANT_ID }
+  # Load secret from file if requested
+  if (-not $SpClientSecret -and $SpClientSecretFile) {
+    try {
+      if (Test-Path -Path $SpClientSecretFile) {
+        $SpClientSecret = (Get-Content -Raw -Path $SpClientSecretFile).Trim()
+      } else {
+        Write-Host "   (warn) Secret file not found: $SpClientSecretFile" -ForegroundColor DarkYellow
+      }
+    } catch {
+      Write-Host "   (warn) Could not read secret file: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+  }
+  # Prompt securely if still missing and user requested prompt
+  if ($SpClientId -and -not $SpClientSecret -and $PromptSpSecret) {
+    try {
+      $sec = Read-Host "Service principal client secret (input hidden)" -AsSecureString
+      if ($sec) { $SpClientSecret = [System.Net.NetworkCredential]::new('', $sec).Password }
+    } catch {
+      Write-Host "   (warn) Secure prompt failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+  }
+  if ($SpClientId -and $SpClientSecret) {
+    $loginTenant = if ($SpTenantId) { $SpTenantId } elseif ($script:TENANT) { $script:TENANT } elseif ($TenantId) { $TenantId } else { '' }
+    if ($loginTenant) {
+      Write-Host "   - Logging in with service principal (clientId=$SpClientId tenant=$loginTenant)" -ForegroundColor Cyan
+      try { az login --service-principal -u $SpClientId -p $SpClientSecret --tenant $loginTenant --only-show-errors | Out-Null } catch { Write-Host "   (error) SP login failed: $($_.Exception.Message)" -ForegroundColor Red }
+    } else {
+      Write-Host "   (warn) Service principal tenant not resolved; skipping SP login." -ForegroundColor DarkYellow
+    }
+  } elseif ($SpClientId -and -not $SpClientSecret) {
+    Write-Host "   (info) SP client id provided but no secret (and none loaded). Use -SpClientSecretFile <path>, set env AZ_SUBDEL_SP_CLIENT_SECRET, or add -PromptSpSecret to input it securely." -ForegroundColor DarkYellow
+  }
+
   az account set --subscription $script:SUB | Out-Null
   # If tenant was left blank, derive it from the current az context and persist
   if ([string]::IsNullOrWhiteSpace($script:TENANT)) {
@@ -676,6 +877,9 @@ function Main {
     }
     [void](Ensure-Az-Tenant-Context -SubscriptionId $subId -TenantId $tenantId -AllowInteractive:$AllowAzInteractiveLogin)
   } catch { }
+
+  # Ensure we have relevant CLI extensions available early (best-effort)
+  Ensure-Cli-Extensions -names @('devcenter','resource-graph')
 
 
 
