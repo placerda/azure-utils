@@ -351,26 +351,16 @@ function Prompt-Context {
   if ([string]::IsNullOrWhiteSpace($reuseSub)) { $reuseSub = 'Y' }
   if ($reuseSub -match '^(n|no)$' -or -not $script:SUB) {
     $subs = az account list --query "[].{id:id,name:name}" -o tsv 2>$null
-    if (-not $subs) {
-      Write-Host "   (error) No subscriptions found in your account." -ForegroundColor Red
-      exit 1
-    }
+    if (-not $subs) { Write-Host "   (error) No subscriptions found." -ForegroundColor Red; exit 1 }
     $subsArr = @()
     foreach ($s in ($subs -split "`n")) {
-      $parts = $s -split "\t"
-      if ($parts.Count -ge 2) {
-        $subsArr += [PSCustomObject]@{ Id=$parts[0]; Name=$parts[1] }
-      }
+      $parts = $s -split "`t"
+      if ($parts.Count -ge 2) { $subsArr += [PSCustomObject]@{ Id=$parts[0]; Name=$parts[1] } }
     }
     Write-Host "`nAvailable subscriptions:" -ForegroundColor Cyan
-    for ($i=0; $i -lt $subsArr.Count; $i++) {
-      Write-Host " [$i] $($subsArr[$i].Name) ($($subsArr[$i].Id))"
-    }
+    for ($i=0; $i -lt $subsArr.Count; $i++) { Write-Host " [$i] $($subsArr[$i].Name) ($($subsArr[$i].Id))" }
     $subChoice = Read-Host "Select subscription index"
-    if (-not $subChoice -or $subChoice -ge $subsArr.Count) {
-      Write-Host "Invalid subscription choice." -ForegroundColor Red
-      exit 1
-    }
+    if (-not $subChoice -or $subChoice -ge $subsArr.Count) { Write-Host "Invalid subscription choice." -ForegroundColor Red; exit 1 }
     $script:SUB = $subsArr[$subChoice].Id
   }
   az account set --subscription $script:SUB | Out-Null
@@ -380,26 +370,16 @@ function Prompt-Context {
   if ([string]::IsNullOrWhiteSpace($reuseRG)) { $reuseRG = 'Y' }
   if ($reuseRG -match '^(n|no)$' -or -not $script:RG) {
     $rgs = az group list --query "[].{name:name,location:location}" -o tsv 2>$null
-    if (-not $rgs) {
-      Write-Host "   (error) No resource groups found in this subscription." -ForegroundColor Red
-      exit 1
-    }
+    if (-not $rgs) { Write-Host "   (error) No resource groups found." -ForegroundColor Red; exit 1 }
     $rgArr = @()
     foreach ($r in ($rgs -split "`n")) {
-      $parts = $r -split "\t"
-      if ($parts.Count -ge 2) {
-        $rgArr += [PSCustomObject]@{ Name=$parts[0]; Location=$parts[1] }
-      }
+      $parts = $r -split "`t"
+      if ($parts.Count -ge 2) { $rgArr += [PSCustomObject]@{ Name=$parts[0]; Location=$parts[1] } }
     }
     Write-Host "`nAvailable resource groups:" -ForegroundColor Cyan
-    for ($i=0; $i -lt $rgArr.Count; $i++) {
-      Write-Host " [$i] $($rgArr[$i].Name) (location=$($rgArr[$i].Location))"
-    }
+    for ($i=0; $i -lt $rgArr.Count; $i++) { Write-Host " [$i] $($rgArr[$i].Name) (location=$($rgArr[$i].Location))" }
     $rgChoice = Read-Host "Select resource group index"
-    if (-not $rgChoice -or $rgChoice -ge $rgArr.Count) {
-      Write-Host "Invalid RG choice." -ForegroundColor Red
-      exit 1
-    }
+    if (-not $rgChoice -or $rgChoice -ge $rgArr.Count) { Write-Host "Invalid RG choice." -ForegroundColor Red; exit 1 }
     $script:RG = $rgArr[$rgChoice].Name
   }
 
@@ -424,6 +404,7 @@ function Prompt-Context {
   Write-Host "Selected Resource Group: $script:RG" -ForegroundColor Green
   Write-Host "Tenant: $script:TENANT" -ForegroundColor Green
 }
+
 
 
 
