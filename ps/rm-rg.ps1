@@ -137,42 +137,6 @@ function Ensure-ACA-Delegation {
   }
 }
 
-function Delete-SALs-CLI {
-  param($salIds)
-  $ok = $true
-  foreach ($sid in ($salIds -split "`n")) {
-    if ([string]::IsNullOrWhiteSpace($sid)) { continue }
-    Write-Host "   - Deleting Service Association Link (CLI): $sid"
-
-    # Try a couple of API versions; up to 5 attempts each; final attempt is --verbose to reveal tenant-policy blocks.
-    $apis = @('2024-03-01','2023-09-01')
-    $deleted = $false
-    foreach ($api in $apis) {
-      $tries = 0
-      do {
-        try {
-          if ($tries -eq 4) {
-            Write-Host "     · final attempt with --verbose (api $api)"
-            az resource delete --ids $sid --api-version $api --verbose
-          } else {
-            az resource delete --ids $sid --api-version $api --only-show-errors | Out-Null
-          }
-          $rc = $LASTEXITCODE
-        } catch { $rc = 1 }
-        if ($rc -ne 0 -and $tries -lt 4) { Start-Sleep -Seconds 5 }
-        $tries++
-      } while ($rc -ne 0 -and $tries -lt 5)
-      if ($rc -eq 0) { $deleted = $true; break }
-    }
-
-    if (-not $deleted) {
-      Write-Host "     (error) SAL delete failed (CLI) for $sid" -ForegroundColor Red
-      $ok = $false
-    }
-  }
-  return $ok
-}
-
 function Ensure-AzModules {
   try {
     Import-Module Az.Accounts -ErrorAction Stop
@@ -185,48 +149,51 @@ function Ensure-AzModules {
   }
 }
 
-function Delete-SALs-AzPS {
-  param(
-    $salIds,
-    [string]$subscriptionId,
-    [string]$tenantId
-  )
-
-  # Ensure Az context is valid for this tenant/subscription
-  $okCtx = Ensure-Az-Tenant-Context -SubscriptionId $subscriptionId -TenantId $tenantId -AllowInteractive:$AllowAzInteractiveLogin
-  if (-not $okCtx) { return $false }
-
+function Delete-SALs-CLI {
+  param($salIds)
   $ok = $true
   foreach ($sid in ($salIds -split "`n")) {
     if ([string]::IsNullOrWhiteSpace($sid)) { continue }
-    Write-Host "   - [Az] Removing SAL: $sid"
+    Write-Host "   - Deleting Service Association Link: $sid"
 
+    $apis = @('2024-03-01','2023-09-01')
     $deleted = $false
-    foreach ($api in @('2024-03-01','2023-09-01')) {
-      try {
-        Remove-AzResource -ResourceId $sid -ApiVersion $api -Force -Confirm:$false -ErrorAction Stop
-        $deleted = $true; break
-      } catch { Start-Sleep 2 }
-    }
-
-    if (-not $deleted) {
-      foreach ($api in @('2024-03-01','2023-09-01')) {
+    foreach ($api in $apis) {
+      $tries = 0
+      do {
         try {
-          Invoke-AzRestMethod -Method DELETE -Path "$sid?api-version=$api" -ErrorAction Stop | Out-Null
-          $deleted = $true; break
-        } catch { Start-Sleep 2 }
-      }
+          az resource delete --ids $sid --api-version $api --only-show-errors | Out-Null
+          $rc = $LASTEXITCODE
+        } catch { $rc = 1 }
+        if ($rc -ne 0 -and $tries -lt 3) { Start-Sleep -Seconds 3 }
+        $tries++
+      } while ($rc -ne 0 -and $tries -lt 4)
+      if ($rc -eq 0) { $deleted = $true; break }
     }
 
-    if (-not $deleted) {
-      Write-Host "     (error) [Az] SAL delete failed: $sid" -ForegroundColor Red
-      $ok = $false
-    }
+    if (-not $deleted) { $ok = $false }
   }
   return $ok
 }
 
+function Delete-ServiceAssociationLinks {
+  param($rg, $vnet, $subnet)
 
+  $salIds = Get-Subnet-SAL-Ids -rg $rg -vnet $vnet -subnet $subnet
+  if (-not $salIds) { return $true }  # Nothing to do
+
+  # Ensure ACA delegation while deleting SALs
+  Ensure-ACA-Delegation -rg $rg -vnet $vnet -subnet $subnet
+
+  # Try delete via CLI only
+  $ok = Delete-SALs-CLI -salIds $salIds
+  if ($ok) {
+    if (Wait-SAL-Gone -rg $rg -vnet $vnet -subnet $subnet -maxSeconds 120) { return $true }
+  }
+
+  # If SALs still remain, just skip silently
+  return $false
+}
 
 
 function Delete-ACAEnvs-Referencing-Subnet {
