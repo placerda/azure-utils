@@ -326,10 +326,19 @@ function Prompt-Context {
     Write-Host "`nAvailable resource groups:" -ForegroundColor Cyan
     for ($i=0; $i -lt $rgArr.Count; $i++) { Write-Host " [$i] $($rgArr[$i].Name) (location=$($rgArr[$i].Location))" }
     $rgChoice = Read-Host "Select resource group index"
-    if (-not $rgChoice -or $rgChoice -ge $rgArr.Count) { Write-Host "Invalid RG choice." -ForegroundColor Red; exit 1 }
-    $script:RG = $rgArr[$rgChoice].Name
+    # FIX: Convert to integer and validate
+    try {
+      $rgChoiceInt = [int]$rgChoice
+      if ($rgChoiceInt -lt 0 -or $rgChoiceInt -ge $rgArr.Count) {
+        Write-Host "Invalid RG choice. Please select a number between 0 and $($rgArr.Count - 1)." -ForegroundColor Red
+        exit 1
+      }
+      $script:RG = $rgArr[$rgChoiceInt].Name
+    } catch {
+      Write-Host "Invalid RG choice. Please enter a valid number." -ForegroundColor Red
+      exit 1
+    }
   }
-
   # --- Tenant ---
   $reuseTenant = if ($script:TENANT) { Read-Host "Reuse last tenant ($script:TENANT)? [Y/n]" } else { 'n' }
   if ([string]::IsNullOrWhiteSpace($reuseTenant)) { $reuseTenant = 'Y' }
