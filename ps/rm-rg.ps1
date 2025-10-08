@@ -3,11 +3,16 @@
 <#
 Script: rm-rg.ps1
 Overview:
-  Safely and forcefully deletes an Azure Resource Group by removing common blockers first.
+  Safely and forcefully deletes an Azure Resource Group or its contents by removing common blockers first.
   Handles: NSG disassociations (NICs/subnets), Private Endpoints on subnets, Service Association Links (Azure Container Apps),
   subnet delegations/service endpoints/route tables/NAT gateways, VNet peerings, Private DNS zone VNet links, RG locks,
   plus heavy blockers: Container Apps, Managed Environments, Application Gateways, Azure Firewalls, Bastion, VMs/NICs.
-  Triggers `az group delete --no-wait` and optionally polls.
+  
+  Behavior controlled by -DeleteResourceGroup parameter:
+    Y (default): Deletes the entire resource group and all its contents
+    N: Deletes only the resources inside the resource group, keeping the RG itself
+  
+  Triggers deletion and optionally polls for completion.
 
 Exit codes:
   1 (input/validation), 2 (delete cmd failed), 3 (timeout), 4 (rollback to Succeeded after Deleting).
@@ -28,7 +33,10 @@ param(
   [string]$SpClientSecretFile,
   [switch]$PromptSpSecret,
   # Keep switch for parity (no-op now that Az fallback is gone)
-  [switch]$ForceSAL
+  [switch]$ForceSAL,
+  # Y: Delete RG and its content; N: Delete only RG content, keep the RG itself
+  [ValidateSet('Y','N')]
+  [string]$DeleteResourceGroup = 'Y'
 )
 
 # Relaunch in pwsh if running under Windows PowerShell (non-Core)
@@ -50,8 +58,9 @@ $env:PYTHONWARNINGS = 'ignore::UserWarning'
 $script:SUB = $null
 $script:RG  = $null
 $script:TENANT = $null
+$script:DELETE_RG = 'Y'
 
-# State file (remember last subscription/RG)
+# State file (remember last subscription/RG/tenant/deleteRG preference)
 $StateFile = Join-Path $env:TEMP 'cleanup-nsgs-last.ps1'
 
 # -------------------- SAL (ACA) helpers --------------------
@@ -286,11 +295,13 @@ function Prompt-Context {
     $script:SUB    = $SUB
     $script:RG     = $RG
     $script:TENANT = $TENANT
+    $script:DELETE_RG = if ($DELETE_RG) { $DELETE_RG } else { 'Y' }
 
     Write-Host "`nLast used:" -ForegroundColor Cyan
     Write-Host "  Subscription: $script:SUB"
     Write-Host "  ResourceGroup: $script:RG"
     Write-Host "  Tenant: $script:TENANT"
+    Write-Host "  DeleteResourceGroup: $script:DELETE_RG"
   }
 
   # --- Subscription ---
@@ -346,19 +357,39 @@ function Prompt-Context {
     try { $script:TENANT = (az account show --query tenantId --output tsv 2>$null).Trim() } catch { $script:TENANT = '' }
   }
 
+  # --- Delete Resource Group Preference ---
+  # Only prompt if not passed as parameter
+  if (-not $PSBoundParameters.ContainsKey('DeleteResourceGroup')) {
+    $reuseDelRG = if ($script:DELETE_RG) { Read-Host "Delete entire resource group or just its content? Last: $script:DELETE_RG [Y=delete RG, N=delete content only, default=$script:DELETE_RG]" } else { '' }
+    if ([string]::IsNullOrWhiteSpace($reuseDelRG)) { 
+      # Keep the last value
+    } else {
+      $reuseDelRG = $reuseDelRG.ToUpper()
+      if ($reuseDelRG -in @('Y','N')) {
+        $script:DELETE_RG = $reuseDelRG
+      }
+    }
+  } else {
+    # Use the parameter value
+    $script:DELETE_RG = $DeleteResourceGroup
+  }
+
   # --- Save state ---
   $safeSub    = $script:SUB -replace "'","''"
   $safeRg     = $script:RG  -replace "'","''"
   $safeTenant = $script:TENANT -replace "'","''"
+  $safeDelRG  = $script:DELETE_RG -replace "'","''"
   Set-Content -Path $StateFile -Value @(
     "`$SUB = '$safeSub'",
     "`$RG  = '$safeRg'",
-    "`$TENANT = '$safeTenant'"
+    "`$TENANT = '$safeTenant'",
+    "`$DELETE_RG = '$safeDelRG'"
   ) -Encoding UTF8
 
   Write-Host "`nSelected Subscription: $script:SUB" -ForegroundColor Green
   Write-Host "Selected Resource Group: $script:RG" -ForegroundColor Green
   Write-Host "Tenant: $script:TENANT" -ForegroundColor Green
+  Write-Host "Delete Resource Group: $script:DELETE_RG (Y=delete RG, N=content only)" -ForegroundColor Green
 }
 
 # -------------------- Network helpers --------------------
@@ -701,10 +732,12 @@ function Main {
     $safeSub    = $script:SUB -replace "'","''"
     $safeRg     = $script:RG  -replace "'","''"
     $safeTenant = $script:TENANT -replace "'","''"
+    $safeDelRG  = $script:DELETE_RG -replace "'","''"
     Set-Content -Path $StateFile -Value @(
       "`$SUB = '$safeSub'",
       "`$RG  = '$safeRg'",
-      "`$TENANT = '$safeTenant'"
+      "`$TENANT = '$safeTenant'",
+      "`$DELETE_RG = '$safeDelRG'"
     ) -Encoding UTF8
   }
 
@@ -777,40 +810,114 @@ function Main {
 
   if ($Confirm -and -not $Force) {
     Write-Host
-    $sure = Read-Host "About to DELETE resource group '$script:RG'. Are you sure? [y/N]"
+    if ($script:DELETE_RG -eq 'Y') {
+      $sure = Read-Host "About to DELETE resource group '$script:RG' and all its content. Are you sure? [y/N]"
+    } else {
+      $sure = Read-Host "About to DELETE all resources inside '$script:RG' (keeping the resource group). Are you sure? [y/N]"
+    }
     if (-not ($sure.ToLower() -in @('y','yes'))) {
-      Write-Host 'Aborted before deleting the resource group.'
+      Write-Host 'Aborted.'
       return
     }
   }
 
-  Write-Host ">> Deleting resource group '$script:RG'…"
-  $deleteArgs = @('group','delete','-n',$script:RG,'--yes','--no-wait')
-  try { az @deleteArgs | Out-Null } catch { Write-Host "(error) RG delete command failed: $($_.Exception.Message)" -ForegroundColor Red; exit 2 }
+  if ($script:DELETE_RG -eq 'Y') {
+    Write-Host ">> Deleting resource group '$script:RG'…"
+    $deleteArgs = @('group','delete','-n',$script:RG,'--yes','--no-wait')
+    try { az @deleteArgs | Out-Null } catch { Write-Host "(error) RG delete command failed: $($_.Exception.Message)" -ForegroundColor Red; exit 2 }
 
-  if ($NoWait) { Write-Host "Delete initiated (no-wait)." -ForegroundColor Green; return }
+    if ($NoWait) { Write-Host "Delete initiated (no-wait)." -ForegroundColor Green; return }
 
-  Write-Host ">> Polling for deletion (timeout ${TimeoutMinutes}m, interval ${PollSeconds}s)…"
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $sawDeleting = $false
-  while ($true) {
-    Start-Sleep -Seconds $PollSeconds
-    try { $state = az group show -n $script:RG --query properties.provisioningState --output tsv 2>$null } catch { $state = 'Deleted' }
-    if (-not $state) { $state = 'Deleted' }
-    Write-Host "   - State: $state (elapsed $([int]$sw.Elapsed.TotalSeconds)s)"
-    if ($state -eq 'Deleted') { break }
-    if ($state -eq 'Deleting') { $sawDeleting = $true }
-    if ($state -eq 'Succeeded' -and $sawDeleting) {
-      Write-Host "Deletion appears to have rolled back to 'Succeeded'. The resource group still exists; deletion likely failed due to blockers (see errors above)." -ForegroundColor Yellow
-      exit 4
+    Write-Host ">> Polling for deletion (timeout ${TimeoutMinutes}m, interval ${PollSeconds}s)…"
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $sawDeleting = $false
+    while ($true) {
+      Start-Sleep -Seconds $PollSeconds
+      try { $state = az group show -n $script:RG --query properties.provisioningState --output tsv 2>$null } catch { $state = 'Deleted' }
+      if (-not $state) { $state = 'Deleted' }
+      Write-Host "   - State: $state (elapsed $([int]$sw.Elapsed.TotalSeconds)s)"
+      if ($state -eq 'Deleted') { break }
+      if ($state -eq 'Deleting') { $sawDeleting = $true }
+      if ($state -eq 'Succeeded' -and $sawDeleting) {
+        Write-Host "Deletion appears to have rolled back to 'Succeeded'. The resource group still exists; deletion likely failed due to blockers (see errors above)." -ForegroundColor Yellow
+        exit 4
+      }
+      if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
+        Write-Host "Timeout waiting for deletion. Investigate remaining resources:" -ForegroundColor Yellow
+        try { az resource list -g $script:RG --output table } catch { }
+        exit 3
+      }
     }
-    if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
-      Write-Host "Timeout waiting for deletion. Investigate remaining resources:" -ForegroundColor Yellow
-      try { az resource list -g $script:RG --output table } catch { }
-      exit 3
+    Write-Host "✅ Resource group deleted (or no longer returned)." -ForegroundColor Green
+  } else {
+    Write-Host ">> Deleting all resources inside resource group '$script:RG' (keeping the RG)…"
+    
+    # List all resources in the resource group
+    try { 
+      $resourceIds = az resource list -g $script:RG --query "[].id" --output tsv 
+    } catch { 
+      Write-Host "(error) Failed to list resources in RG: $($_.Exception.Message)" -ForegroundColor Red
+      exit 2
     }
+    
+    if (-not $resourceIds) {
+      Write-Host "✅ No resources found in resource group. Resource group is already empty." -ForegroundColor Green
+      return
+    }
+    
+    $resourcesToDelete = $resourceIds -split "`n" | Where-Object { $_ }
+    $totalResources = $resourcesToDelete.Count
+    Write-Host "   - Found $totalResources resource(s) to delete"
+    
+    $deletedCount = 0
+    $failedCount = 0
+    
+    foreach ($rid in $resourcesToDelete) {
+      if ([string]::IsNullOrWhiteSpace($rid)) { continue }
+      $resourceName = $rid.Split('/')[-1]
+      Write-Host "   - Deleting resource: $resourceName"
+      try { 
+        az resource delete --ids $rid --no-wait | Out-Null
+        $deletedCount++
+      } catch { 
+        Write-Host "     (warn) Failed to delete resource: $rid" -ForegroundColor DarkYellow
+        $failedCount++
+      }
+    }
+    
+    if ($NoWait) { 
+      Write-Host "✅ Delete initiated for $deletedCount resource(s) (no-wait). Resource group '$script:RG' remains." -ForegroundColor Green
+      if ($failedCount -gt 0) {
+        Write-Host "   - $failedCount resource(s) failed to delete" -ForegroundColor Yellow
+      }
+      return 
+    }
+    
+    # Poll to ensure resources are deleted
+    Write-Host ">> Polling for resource deletion (timeout ${TimeoutMinutes}m, interval ${PollSeconds}s)…"
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+      Start-Sleep -Seconds $PollSeconds
+      try { 
+        $remainingResources = az resource list -g $script:RG --query "[].id" --output tsv 
+        $remaining = if ($remainingResources) { ($remainingResources -split "`n" | Where-Object { $_ }).Count } else { 0 }
+      } catch { 
+        $remaining = 0 
+      }
+      
+      Write-Host "   - Remaining resources: $remaining (elapsed $([int]$sw.Elapsed.TotalSeconds)s)"
+      
+      if ($remaining -eq 0) { break }
+      
+      if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
+        Write-Host "Timeout waiting for all resources to be deleted. Some resources may still remain:" -ForegroundColor Yellow
+        try { az resource list -g $script:RG --output table } catch { }
+        exit 3
+      }
+    }
+    
+    Write-Host "✅ All resources deleted from resource group '$script:RG'. Resource group remains." -ForegroundColor Green
   }
-  Write-Host "✅ Resource group deleted (or no longer returned)." -ForegroundColor Green
 }
 
 Main
