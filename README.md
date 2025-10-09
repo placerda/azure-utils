@@ -48,6 +48,14 @@ Deletes documents from a Search index (by key or filter) to keep it tidy.
 pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/rm-index-documents.ps1').Content"
 ```
 
+### 🌐 Create an Azure Virtual Network — `ps/create-vnet.ps1`
+
+Creates a new Azure VNet with interactive prompts. Remembers your last settings (subscription, resource group, VNet name, address prefix, location) and asks if you want to reuse them. Creates the resource group if it doesn't exist.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/create-vnet.ps1').Content"
+```
+
 ---
 
 ## License
