@@ -56,6 +56,35 @@ Creates a new Azure VNet with interactive prompts. Remembers your last settings 
 pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/create-vnet.ps1').Content"
 ```
 
+### 🏗️ Create an Azure VNet with Pre-configured Subnets — `ps/create-vnet-with-subnets.ps1`
+
+Creates an Azure VNet with 11 pre-configured subnets designed for enterprise workloads. Includes subnets for AI Foundry agents, Container Apps, Private Endpoints, Bastion, Firewall, Gateway, App Gateway, Jumpbox, DevOps agents, API Management (optional), and PostgreSQL (optional). Each subnet is configured with appropriate address ranges, delegations, and service endpoints.
+
+**Features:**
+- 🎯 **9 base subnets** always created (agent, ACA, PE, Bastion, Firewall, Gateway, App Gateway, jumpbox, DevOps)
+- 🔧 **2 optional subnets** for API Management and PostgreSQL (use `-SkipApim` or `-SkipPostgres` to exclude)
+- 📦 **Address space:** 192.168.0.0/21 (2048 IPs total)
+- 🔐 **Delegations configured:** Microsoft.App/environments, Microsoft.DBforPostgreSQL/flexibleServers
+- 🌐 **Service endpoints:** CognitiveServices, AzureCosmosDB where needed
+- 💡 **PE subnet:** /26 (64 IPs) to prevent race conditions during parallel Private Endpoint creation
+- 💾 **Remembers settings** like the original create-vnet.ps1
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/create-vnet-with-subnets.ps1').Content"
+```
+
+**Local usage examples:**
+```powershell
+# Interactive mode
+.\ps\create-vnet-with-subnets.ps1
+
+# With parameters
+.\ps\create-vnet-with-subnets.ps1 -ResourceGroup "my-rg" -VNetName "my-vnet"
+
+# Skip optional subnets
+.\ps\create-vnet-with-subnets.ps1 -SkipApim -SkipPostgres
+```
+
 ---
 
 ## License
