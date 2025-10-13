@@ -6,7 +6,8 @@ Overview:
   Safely and forcefully deletes an Azure Resource Group or its contents by removing common blockers first.
   Handles: NSG disassociations (NICs/subnets), Private Endpoints on subnets, Service Association Links (Azure Container Apps),
   subnet delegations/service endpoints/route tables/NAT gateways, VNet peerings, Private DNS zone VNet links, RG locks,
-  plus heavy blockers: Container Apps, Managed Environments, Application Gateways, Azure Firewalls, Bastion, VMs/NICs.
+  plus heavy blockers: Container Apps, Managed Environments, Application Gateways, Azure Firewalls, Bastion, VMs/NICs,
+  and Azure AI Search services (including shared private link resources and private endpoint connections cleanup).
   
   Behavior controlled by -DeleteResourceGroup parameter:
     Y (default): Deletes the entire resource group and all its contents
@@ -16,6 +17,56 @@ Overview:
 
 Exit codes:
   1 (input/validation), 2 (delete cmd failed), 3 (timeout), 4 (rollback to Succeeded after Deleting).
+
+MANUAL DELETION GUIDE - If you want to delete manually:
+  This script automates complex Azure resource group deletion by handling dependency blockers.
+  If you prefer manual deletion, follow these high-level steps in the exact order shown below
+  to avoid the common blockers that prevent resource group deletion:
+
+  1. PREPARATION:
+     • Remove any resource locks at the resource group level
+     • Identify all NSGs (Network Security Groups) in the resource group
+
+  2. NSG CLEANUP (for each NSG):
+     • Remove NSG associations from all NICs (Network Interfaces) 
+     • Remove NSG associations from all subnets
+     • Delete the NSG itself
+
+  3. HEAVY RESOURCE CLEANUP (delete in this order):
+     • Delete all Container Apps
+     • Delete all Container Apps Managed Environments  
+     • Delete all Application Gateways
+     • Delete all Azure Firewalls
+     • Delete all Bastion hosts
+     • Delete all Virtual Machines
+     • Delete orphaned Network Interface Cards (NICs not attached to VMs or Private Endpoints)
+
+  4. SEARCH SERVICES CLEANUP (for each Azure AI Search service):
+     • Delete all shared private link resources
+     • Delete all private endpoint connections
+     • Enable public network access (if deletion fails due to private access restrictions)
+     • Delete the search service
+
+  5. VNET/SUBNET CLEANUP (for each VNet):
+     • For each subnet:
+       - Delete DevCenter environments, projects, network connections, and devcenters referencing the subnet
+       - Delete Connected Environments, DevOps Infrastructure, App Service Environments, Batch pools referencing the subnet
+       - Delete Private Endpoints on the subnet
+       - Delete cross-RG Container Apps Managed Environments using the subnet
+       - Delete Service Association Links (SALs) - may require ACA delegation
+       - Remove subnet properties: NSG, route table, NAT gateway, delegations, service endpoints
+       - Delete the subnet
+     • Delete all VNet peerings
+     • Remove Private DNS zone VNet links
+     • Detach DDoS protection plans
+     • Delete the VNet
+
+  6. FINAL CLEANUP:
+     • Remove any remaining resource locks
+     • Delete the resource group (or remaining resources if keeping the RG)
+
+  Note: Some resources may have cross-resource group dependencies that need to be resolved first.
+        Wait between deletion steps as some operations are asynchronous.
 #>
 
 param(
@@ -588,6 +639,84 @@ function Delete-VMs-And-NICs-In-RG {
   }
 }
 
+function Delete-SearchServices-In-RG {
+  param($rg)
+  Write-Host ">> Force-deleting Azure AI Search services in '$rg'…"
+  
+  try { 
+    $searchServices = az search service list -g $rg --query "[].{name:name,id:id}" --output json | ConvertFrom-Json
+  } catch { 
+    $searchServices = @()
+  }
+  
+  foreach ($service in $searchServices) {
+    if (-not $service.name) { continue }
+    
+    Write-Host "   - Processing Search service: $($service.name)"
+    
+    # Step 1: Remove shared private link resources
+    Write-Host "     · Removing shared private link resources..."
+    try {
+      $sharedLinks = az search shared-private-link-resource list --service-name $service.name -g $rg --query "[].name" --output tsv 2>$null
+      if ($sharedLinks) {
+        foreach ($linkName in ($sharedLinks -split "`n")) {
+          if ($linkName) {
+            Write-Host "       - Deleting shared private link: $linkName"
+            try { 
+              az search shared-private-link-resource delete --name $linkName --service-name $service.name -g $rg --yes | Out-Null 
+            } catch { 
+              Write-Host "         (warn) failed to delete shared private link: $linkName" -ForegroundColor DarkYellow 
+            }
+          }
+        }
+      }
+    } catch { 
+      Write-Host "       (info) No shared private links found or failed to list" -ForegroundColor DarkCyan 
+    }
+    
+    # Step 2: Remove private endpoint connections
+    Write-Host "     · Removing private endpoint connections..."
+    try {
+      $peConnections = az search private-endpoint-connection list --service-name $service.name -g $rg --query "[].name" --output tsv 2>$null
+      if ($peConnections) {
+        foreach ($peName in ($peConnections -split "`n")) {
+          if ($peName) {
+            Write-Host "       - Deleting private endpoint connection: $peName"
+            try { 
+              az search private-endpoint-connection delete --name $peName --service-name $service.name -g $rg | Out-Null 
+            } catch { 
+              Write-Host "         (warn) failed to delete private endpoint connection: $peName" -ForegroundColor DarkYellow 
+            }
+          }
+        }
+      }
+    } catch { 
+      Write-Host "       (info) No private endpoint connections found or failed to list" -ForegroundColor DarkCyan 
+    }
+
+    # Wait a bit for cleanup to complete
+    Write-Host "     · Waiting for private access cleanup to complete..."
+    Start-Sleep -Seconds 15
+    
+    # Step 3: Enable public network access if needed (to allow deletion)
+    Write-Host "     · Enabling public network access for deletion..."
+    try {
+      az search service update --name $service.name -g $rg --public-access Enabled | Out-Null
+      Start-Sleep -Seconds 5
+    } catch {
+      Write-Host "       (warn) failed to enable public access" -ForegroundColor DarkYellow
+    }
+    
+    # Step 4: Delete the search service
+    Write-Host "     · Deleting Search service: $($service.name)"
+    try { 
+      az search service delete --name $service.name -g $rg --yes | Out-Null 
+    } catch { 
+      Write-Host "       (warn) failed to delete search service: $($service.name)" -ForegroundColor DarkYellow 
+    }
+  }
+}
+
 function Detach-VNet-DdosPlan {
   param($rg, $vnet)
   try {
@@ -621,6 +750,7 @@ function Break-VNet-Blockers-In-RG {
   Delete-AzureFirewalls-In-RG      -rg $rg
   Delete-Bastions-In-RG            -rg $rg
   Delete-VMs-And-NICs-In-RG        -rg $rg
+  Delete-SearchServices-In-RG      -rg $rg
 
   try { $vnetNamesRaw = az network vnet list -g $rg --query "[].name" --output tsv } catch { $vnetNamesRaw = '' }
   if ($vnetNamesRaw) {
