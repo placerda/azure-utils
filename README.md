@@ -17,13 +17,6 @@ Each script comes with a one-liner you can copy, paste, and run instantly.
 > [!Tip]  
 > Just copy the command below each script and run it in your PowerShell 7 terminal.
 
-### 🌐 Enable public access in a Resource Group — `ps/set-public.ps1`
-Turns on public network access for Storage Accounts, Key Vaults, and Cosmos DB (doesn’t remove private endpoints).
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/set-public.ps1').Content"
-````
-
 ### 🔑 Fetch a Dapr token for local/dev — `ps/get-dapr-token.ps1`
 
 Pulls a Container App Dapr API token so you can quickly wire up local or dev services.
@@ -47,6 +40,13 @@ Deletes documents from a Search index (by key or filter) to keep it tidy.
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/rm-index-documents.ps1').Content"
 ```
+
+### 🌐 Enable public access in a Resource Group — `ps/set-public.ps1`
+Turns on public network access for Storage Accounts, Key Vaults, and Cosmos DB (doesn’t remove private endpoints).
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/set-public.ps1').Content"
+````
 
 ### 🌐 Create an Azure Virtual Network — `ps/create-vnet.ps1`
 
