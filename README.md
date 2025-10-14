@@ -25,7 +25,15 @@ Pulls a Container App Dapr API token so you can quickly wire up local or dev ser
 pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/get-dapr-token.ps1').Content"
 ```
 
-### 🧹 Clean up & delete a Resource Group — `ps/rm-rg.ps1`
+### 🧪 Check Azure AI Search Agentic setup — `ps/check-agentic-setup.ps1`
+
+Verifies Azure AI Search Agentic Retrieval configuration, knowledge sources, vectorizers, and semantic search settings.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/check-agentic-setup.ps1').Content"
+```
+
+### �🧹 Clean up & delete a Resource Group — `ps/rm-rg.ps1`
 
 Removes blockers (NSGs, Private Endpoints, subnet settings, PDNS links, locks, etc.) and forcefully deletes the RG.
 

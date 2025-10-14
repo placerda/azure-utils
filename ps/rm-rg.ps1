@@ -639,6 +639,26 @@ function Delete-VMs-And-NICs-In-RG {
   }
 }
 
+function Force-Delete-Remaining-SearchServices {
+  param($rg)
+  Write-Host ">> Checking for remaining Search services and forcing deletion..." -ForegroundColor Cyan
+  
+  try { 
+    $searchServices = az search service list -g $rg --query "[].{name:name,id:id}" --output json | ConvertFrom-Json
+  } catch { 
+    $searchServices = @()
+  }
+  
+  foreach ($service in $searchServices) {
+    if (-not $service.name) { continue }
+    Write-Host "   - Force deleting remaining Search service: $($service.name)"
+    
+    # Try multiple approaches to force delete
+    try { az search service delete --name $service.name -g $rg --yes --no-wait | Out-Null } catch { }
+    try { az resource delete --ids $service.id --no-wait | Out-Null } catch { }
+  }
+}
+
 function Delete-SearchServices-In-RG {
   param($rg)
   Write-Host ">> Force-deleting Azure AI Search services in '$rg'…"
@@ -661,9 +681,22 @@ function Delete-SearchServices-In-RG {
       if ($sharedLinks) {
         foreach ($linkName in ($sharedLinks -split "`n")) {
           if ($linkName) {
-            Write-Host "       - Deleting shared private link: $linkName"
+            Write-Host "       - Deleting shared private link: $linkName (with timeout)"
             try { 
-              az search shared-private-link-resource delete --name $linkName --service-name $service.name -g $rg --yes | Out-Null 
+              # Add timeout for shared private link deletion
+              $job = Start-Job -ScriptBlock { 
+                param($linkName, $serviceName, $rg)
+                az search shared-private-link-resource delete --name $linkName --service-name $serviceName -g $rg --yes --no-wait 2>$null
+              } -ArgumentList $linkName, $service.name, $rg
+              
+              # Wait max 20 seconds for the job
+              if (Wait-Job -Job $job -Timeout 20) {
+                Receive-Job -Job $job | Out-Null
+              } else {
+                Write-Host "         (warn) timeout deleting shared private link: $linkName" -ForegroundColor DarkYellow
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+              }
+              Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
             } catch { 
               Write-Host "         (warn) failed to delete shared private link: $linkName" -ForegroundColor DarkYellow 
             }
@@ -681,9 +714,22 @@ function Delete-SearchServices-In-RG {
       if ($peConnections) {
         foreach ($peName in ($peConnections -split "`n")) {
           if ($peName) {
-            Write-Host "       - Deleting private endpoint connection: $peName"
+            Write-Host "       - Deleting private endpoint connection: $peName (with timeout)"
             try { 
-              az search private-endpoint-connection delete --name $peName --service-name $service.name -g $rg | Out-Null 
+              # Add timeout and async deletion for private endpoint connections
+              $job = Start-Job -ScriptBlock { 
+                param($serviceName, $rg, $peName)
+                az search private-endpoint-connection delete --name $peName --service-name $serviceName -g $rg --no-wait 2>$null
+              } -ArgumentList $service.name, $rg, $peName
+              
+              # Wait max 30 seconds for the job
+              if (Wait-Job -Job $job -Timeout 30) {
+                Receive-Job -Job $job | Out-Null
+              } else {
+                Write-Host "         (warn) timeout deleting private endpoint connection: $peName" -ForegroundColor DarkYellow
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+              }
+              Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
             } catch { 
               Write-Host "         (warn) failed to delete private endpoint connection: $peName" -ForegroundColor DarkYellow 
             }
@@ -708,9 +754,23 @@ function Delete-SearchServices-In-RG {
     }
     
     # Step 4: Delete the search service
-    Write-Host "     · Deleting Search service: $($service.name)"
+    Write-Host "     · Deleting Search service: $($service.name) (with timeout)"
     try { 
-      az search service delete --name $service.name -g $rg --yes | Out-Null 
+      # Add timeout for search service deletion
+      $job = Start-Job -ScriptBlock { 
+        param($serviceName, $rg)
+        az search service delete --name $serviceName -g $rg --yes --no-wait 2>$null
+      } -ArgumentList $service.name, $rg
+      
+      # Wait max 60 seconds for the job
+      if (Wait-Job -Job $job -Timeout 60) {
+        Receive-Job -Job $job | Out-Null
+        Write-Host "       · Search service deletion initiated successfully"
+      } else {
+        Write-Host "       (warn) timeout deleting search service: $($service.name)" -ForegroundColor DarkYellow
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+      }
+      Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
     } catch { 
       Write-Host "       (warn) failed to delete search service: $($service.name)" -ForegroundColor DarkYellow 
     }
@@ -973,8 +1033,44 @@ function Main {
         exit 4
       }
       if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
-        Write-Host "Timeout waiting for deletion. Investigate remaining resources:" -ForegroundColor Yellow
-        try { az resource list -g $script:RG --output table } catch { }
+        Write-Host "Timeout waiting for deletion. Investigating remaining resources:" -ForegroundColor Yellow
+        try { 
+          $remainingList = az resource list -g $script:RG --output table
+          Write-Host $remainingList
+          
+          # Try to force delete remaining resources
+          Write-Host ">> Attempting to force delete remaining resources..." -ForegroundColor Cyan
+          
+          # Special handling for Search services that might still be processing
+          Force-Delete-Remaining-SearchServices -rg $script:RG
+          
+          $remainingIds = az resource list -g $script:RG --query "[].id" --output tsv
+          if ($remainingIds) {
+            foreach ($rid in ($remainingIds -split "`n")) {
+              if ($rid) {
+                $resourceName = $rid.Split('/')[-1]
+                Write-Host "   - Force deleting: $resourceName"
+                try { 
+                  az resource delete --ids $rid --no-wait | Out-Null 
+                } catch { 
+                  Write-Host "     (warn) Force delete failed: $resourceName" -ForegroundColor DarkYellow
+                }
+              }
+            }
+            
+            # Wait a bit and retry RG deletion
+            Write-Host "   - Waiting for force deletions to process..."
+            Start-Sleep -Seconds 30
+            
+            Write-Host ">> Retrying resource group deletion..." -ForegroundColor Cyan
+            try { 
+              az group delete -n $script:RG --yes --no-wait | Out-Null
+              Write-Host "   - RG deletion re-initiated. Check Azure portal for final status." -ForegroundColor Green
+            } catch {
+              Write-Host "   - RG deletion retry failed. Manual cleanup may be required." -ForegroundColor Red
+            }
+          }
+        } catch { }
         exit 3
       }
     }
