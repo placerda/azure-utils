@@ -145,7 +145,12 @@ function Get-ExecutionMode {
     Write-Host "Select execution mode:" -ForegroundColor Cyan
     Write-Host "  1. Local (localhost:80)" -ForegroundColor White
     Write-Host "  2. Remote (Azure Container App)" -ForegroundColor White
-    $choice = Read-Host "Enter choice [1 or 2]"
+    $choice = Read-Host "Enter choice [1 or 2] (default: 1)"
+    
+    # Default to option 1 if empty
+    if ([string]::IsNullOrWhiteSpace($choice)) {
+        $choice = "1"
+    }
     
     if ($choice -eq "1") {
         $script:MODE = "local"
