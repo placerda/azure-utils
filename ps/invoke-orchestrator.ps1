@@ -481,18 +481,36 @@ function Invoke-OrchestratorQuery {
     
     try {
         Write-Host "⏳ Sending request..." -ForegroundColor Yellow
-        $startTime = Get-Date
+        $requestStartTime = Get-Date
         
         # Make the request and capture response
         $response = Invoke-WebRequest -Uri $url -Method POST -Headers $headers -Body $body -ErrorAction Stop
         
-        $elapsed = ((Get-Date) - $startTime).TotalMilliseconds
+        $firstByteTime = Get-Date
+        $timeToFirstByte = ($firstByteTime - $requestStartTime).TotalMilliseconds
         
-        Write-Host "✅ Response received in $([math]::Round($elapsed, 0))ms" -ForegroundColor Green
+        Write-Host "✅ Response received (first byte in $([math]::Round($timeToFirstByte, 0))ms)" -ForegroundColor Green
         Write-Host ""
         
         # Format and display response
         Format-OrchestratorResponse -response $response
+        
+        $responseEndTime = Get-Date
+        $totalResponseTime = ($responseEndTime - $firstByteTime).TotalMilliseconds
+        $totalTime = ($responseEndTime - $requestStartTime).TotalMilliseconds
+        
+        # Display timing information
+        Write-Host ""
+        Write-Host ("=" * 60) -ForegroundColor Cyan
+        Write-Host "⏱️  TIMING INFORMATION" -ForegroundColor Cyan
+        Write-Host ("=" * 60) -ForegroundColor Cyan
+        Write-Host "Time to First Byte (TTFB): " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($timeToFirstByte, 2))ms" -ForegroundColor Yellow
+        Write-Host "Response Processing Time:  " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($totalResponseTime, 2))ms" -ForegroundColor Yellow
+        Write-Host "Total Elapsed Time:        " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($totalTime, 2))ms" -ForegroundColor Yellow
+        Write-Host ("=" * 60) -ForegroundColor Cyan
         
         return $true
         
@@ -575,13 +593,12 @@ function Format-OrchestratorResponse {
                 if ($trimmed.StartsWith('{') -or $trimmed.StartsWith('[')) {
                     try {
                         $jsonLine = $trimmed | ConvertFrom-Json
-                        Write-Host "  📦 " -NoNewline -ForegroundColor Cyan
                         Write-Host ($jsonLine | ConvertTo-Json -Compress) -ForegroundColor White
                     } catch {
-                        Write-Host "  ▸ $trimmed" -ForegroundColor White
+                        Write-Host $trimmed -ForegroundColor White
                     }
                 } else {
-                    Write-Host "  ▸ $trimmed" -ForegroundColor White
+                    Write-Host $trimmed -ForegroundColor White
                 }
             }
         }
