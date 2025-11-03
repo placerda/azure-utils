@@ -32,6 +32,7 @@ Each script comes with a one-liner you can copy, paste, and run instantly.
 - [🐳 Container Apps](#container-apps)
 - [🌐 Networking](#networking)
 - [🔷 Resource Group](#resource-group)
+- [🔄 GitHub Projects](#github-projects)
 
 ## GPT-RAG
 
@@ -148,6 +149,56 @@ pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubus
 
 # Skip optional subnets
 .\ps\create-vnet-with-subnets.ps1 -SkipApim -SkipPostgres
+```
+
+## GitHub Projects
+
+### 🔄 Sync Project Fields — `ps/gh-projects.ps1`
+
+Synchronizes Start Date, End Date, and Status fields from issues in their original GitHub projects to a consolidated project.
+
+**Features:**
+
+* Automatic GitHub CLI authentication with project scope
+* Interactive prompts for project number and organization
+* Syncs date fields (Start Date, End Date) from source projects
+* Syncs status field with emoji cleanup
+* Shows all available fields and their types
+* Detailed progress reporting
+
+**Prerequisites:**
+
+* GitHub CLI (`gh`) installed
+* Authenticated with GitHub (`gh auth login`)
+* Project scope enabled (script handles this automatically)
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/gh-projects.ps1').Content"
+```
+
+**Local usage:**
+
+```powershell
+# Interactive mode
+.\ps\gh-projects.ps1
+```
+
+**Example:**
+
+```
+Project number (e.g., 885): 885
+Organization/owner (e.g., Azure): Azure
+
+✅ Found project: Prometheus Program
+✅ Found 2 items to process
+
+Processing: Azure/GPT-RAG#374
+  ✓ Start:  2025-11-10
+  ✓ End:    2025-11-21
+  ✓ Status: Backlog
+  ✅ Updated Start Date to 2025-11-10
+  ✅ Updated End Date to 2025-11-21
+  ✅ Updated Status to Backlog
 ```
 
 ## License
