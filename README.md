@@ -160,11 +160,15 @@ Synchronizes Start Date, End Date, and Status fields from issues in their origin
 **Features:**
 
 * Automatic GitHub CLI authentication with project scope
-* Interactive prompts for project number and organization
-* Syncs date fields (Start Date, End Date) from source projects
+* Interactive prompts with default values (project 885, org Azure)
+* Syncs date fields from source projects (Start Date, End Date, Target Date)
+* Falls back to Iteration dates when direct dates are unavailable
+* Case-insensitive field name matching
+* Excludes consolidated project from source data search
+* Prioritizes projects with complete date information
 * Syncs status field with emoji cleanup
 * Shows all available fields and their types
-* Detailed progress reporting
+* Detailed progress reporting with debug information
 
 **Prerequisites:**
 
@@ -179,26 +183,90 @@ pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubus
 **Local usage:**
 
 ```powershell
-# Interactive mode
+# Interactive mode (with defaults)
 .\ps\gh-projects.ps1
 ```
 
 **Example:**
 
 ```
-Project number (e.g., 885): 885
-Organization/owner (e.g., Azure): Azure
+Project number [default: 885]: <Enter>
+Organization/owner [default: Azure]: <Enter>
 
 ✅ Found project: Prometheus Program
-✅ Found 2 items to process
+✅ Found 25 items to process
 
-Processing: Azure/GPT-RAG#374
-  ✓ Start:  2025-11-10
-  ✓ End:    2025-11-21
+Processing: Azure/doc-proc-solution-accelerator#39
+  📁 Found in 2 project(s):
+     - Prometheus Program
+     - Doc-Proc-Solution-Accelerator
+  🔍 Checking project: Doc-Proc-Solution-Accelerator
+     ✓ Found Iteration: Iteration 3
+       - Start: 2025-11-29, Duration: 14 days
+     ✓ Using Iteration Start Date: 2025-11-29
+     ✓ Using Iteration End Date: 2025-12-12
+  ✓ Start:  2025-11-29 (from Iteration (Iteration 3))
+  ✓ End:    2025-12-12 (from Iteration (Iteration 3))
   ✓ Status: Backlog
-  ✅ Updated Start Date to 2025-11-10
-  ✅ Updated End Date to 2025-11-21
+  ✅ Updated Start Date to 2025-11-29
+  ✅ Updated End Date to 2025-12-12
   ✅ Updated Status to Backlog
+```
+
+### 📦 Migrate Issues Between Repositories — `ps/gh-migrate-items.ps1`
+
+Migrates all issues from one GitHub repository to another, preserving titles, descriptions, labels, and state.
+
+**Features:**
+
+* Automatic GitHub CLI authentication
+* Interactive prompts for source and destination repository URLs
+* Migrates all issue data (title, body, labels, state)
+* Creates labels in destination if they don't exist
+* Adds reference to original issue in migrated body
+* Preserves issue state (open/closed)
+* Confirmation prompt before migration
+* Progress reporting with success/failure counts
+* Rate limiting protection
+
+**Prerequisites:**
+
+* GitHub CLI (`gh`) installed
+* Authenticated with GitHub (`gh auth login`)
+* Write access to destination repository
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "iex (iwr 'https://raw.githubusercontent.com/placerda/azure-utils/main/ps/gh-migrate-items.ps1').Content"
+```
+
+**Local usage:**
+
+```powershell
+# Interactive mode
+.\ps\gh-migrate-items.ps1
+```
+
+**Example:**
+
+```
+Source repository URL: https://github.com/Azure/source-repo
+Destination repository URL: https://github.com/Azure/dest-repo
+
+✅ Found 15 issue(s) to migrate
+
+⚠️  WARNING: This will create 15 new issue(s) in Azure/dest-repo
+Do you want to continue? (yes/no): yes
+
+Migrating issue #1: First issue title
+  ✅ Created: https://github.com/Azure/dest-repo/issues/1
+
+Migrating issue #2: Second issue title
+  ✅ Created: https://github.com/Azure/dest-repo/issues/2
+  ✅ Closed issue (matching source state)
+
+✅ Migration completed!
+   Success: 15
+   Failed:  0
 ```
 
 ## License

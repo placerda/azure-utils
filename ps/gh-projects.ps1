@@ -13,8 +13,10 @@
     - Authenticates with GitHub CLI (prompts if needed)
     - Fetches all items from the consolidated project
     - For each item, finds the same issue in its original project
-    - Copies Start Date, End Date, and Status fields to the consolidated project
+    - Copies Start Date, End Date (or Target Date), and Status fields to the consolidated project
+    - Falls back to Iteration dates if direct dates are not available
     - Handles emoji cleanup in status field names
+    - Uses case-insensitive field name matching
     
     Prerequisites:
     - GitHub CLI (gh) installed and authenticated
@@ -133,21 +135,24 @@ if ($authStatus -notmatch "Logged in") {
 Write-Host ""
 
 # Ask for the consolidated project number and owner
+Write-Host "ℹ️  This tool synchronizes dates and status from source projects to a consolidated project." -ForegroundColor Blue
+Write-Host "   It will:" -ForegroundColor Blue
+Write-Host "   - Find issues in their original (source) projects" -ForegroundColor Blue
+Write-Host "   - Copy Start Date, End Date, and Status to your consolidated project" -ForegroundColor Blue
+Write-Host "   - Use Iteration dates when direct dates aren't available" -ForegroundColor Blue
+Write-Host ""
+
 Write-Host "Enter project information from the URL:" -ForegroundColor Cyan
 Write-Host "Example: https://github.com/orgs/Azure/projects/885/views/2" -ForegroundColor Gray
 Write-Host ""
 
-$projectNumber = Read-Host "Project number (e.g., 885)"
-if (-not $projectNumber) {
-    Write-Host "❌ Project number is required." -ForegroundColor Red
-    exit
-}
+$projectNumberInput = Read-Host "Project number [default: 885]"
+$projectNumber = if ([string]::IsNullOrWhiteSpace($projectNumberInput)) { "885" } else { $projectNumberInput }
+Write-Host "Using project number: $projectNumber" -ForegroundColor Gray
 
-$projectOwner = Read-Host "Organization/owner (e.g., Azure)"
-if (-not $projectOwner) {
-    Write-Host "❌ Organization/owner is required." -ForegroundColor Red
-    exit
-}
+$projectOwnerInput = Read-Host "Organization/owner [default: Azure]"
+$projectOwner = if ([string]::IsNullOrWhiteSpace($projectOwnerInput)) { "Azure" } else { $projectOwnerInput }
+Write-Host "Using organization: $projectOwner" -ForegroundColor Gray
 
 Write-Host ""
 Write-Host "📥 Fetching project information..." -ForegroundColor Yellow
@@ -188,7 +193,15 @@ Write-Host "📋 Fetching project items..." -ForegroundColor Yellow
 # Define field names (adjust to your actual field names)
 $startFieldName = "Start Date"
 $endFieldName = "End Date"
+$targetFieldName = "Target Date"
 $statusFieldName = "Status"
+$iterationFieldName = "Iteration"
+
+# Helper function for case-insensitive field name comparison
+function Compare-FieldName {
+    param($name1, $name2)
+    return $name1 -and $name2 -and ($name1.ToLower() -eq $name2.ToLower())
+}
 
 # Get project fields via GraphQL
 Write-Host "Fetching project fields..." -ForegroundColor Gray
@@ -212,6 +225,19 @@ $fieldsQuery = @"
               name
             }
           }
+          ... on ProjectV2IterationField {
+            id
+            name
+            dataType
+            configuration {
+              iterations {
+                id
+                title
+                startDate
+                duration
+              }
+            }
+          }
         }
       }
     }
@@ -227,24 +253,48 @@ foreach ($field in $projectFields) {
     if ($field.options) {
         $optionNames = ($field.options | ForEach-Object { $_.name }) -join ', '
         Write-Host "  - '$($field.name)' (Type: $($field.dataType), Options: $optionNames)" -ForegroundColor Gray
+    } elseif ($field.configuration -and $field.configuration.iterations) {
+        $iterationCount = $field.configuration.iterations.Count
+        Write-Host "  - '$($field.name)' (Type: $($field.dataType), Iterations: $iterationCount)" -ForegroundColor Gray
     } else {
         Write-Host "  - '$($field.name)' (Type: $($field.dataType))" -ForegroundColor Gray
     }
 }
 Write-Host ""
 
-# Create a hashtable for quick field lookup
+# Create a hashtable for quick field lookup (case-insensitive)
 $fieldMap = @{}
 $fieldOptionsMap = @{}
+$iterationMap = @{}
+
 foreach ($field in $projectFields) {
-    $fieldMap[$field.name] = $field.id
+    $fieldMap[$field.name.ToLower()] = $field.id
     if ($field.options) {
         # Create a map of option names to option IDs for single-select fields
         $optionMap = @{}
         foreach ($option in $field.options) {
             $optionMap[$option.name] = $option.id
         }
-        $fieldOptionsMap[$field.name] = $optionMap
+        $fieldOptionsMap[$field.name.ToLower()] = $optionMap
+    }
+    if ($field.configuration -and $field.configuration.iterations) {
+        # Create a map of iteration titles to their details
+        $iterMap = @{}
+        foreach ($iter in $field.configuration.iterations) {
+            # Calculate end date from start date and duration
+            if ($iter.startDate -and $iter.duration) {
+                $startDate = [DateTime]::Parse($iter.startDate)
+                $endDate = $startDate.AddDays($iter.duration)
+                $iterMap[$iter.title] = @{
+                    Id = $iter.id
+                    Title = $iter.title
+                    StartDate = $iter.startDate
+                    EndDate = $endDate.ToString("yyyy-MM-dd")
+                    Duration = $iter.duration
+                }
+            }
+        }
+        $iterationMap[$field.name.ToLower()] = $iterMap
     }
 }
 
@@ -298,7 +348,7 @@ foreach ($item in $items) {
             title
             id
           }
-          fieldValues(first: 20) {
+          fieldValues(first: 30) {
             nodes {
               ... on ProjectV2ItemFieldDateValue {
                 date
@@ -316,6 +366,16 @@ foreach ($item in $items) {
                   }
                 }
               }
+              ... on ProjectV2ItemFieldIterationValue {
+                title
+                startDate
+                duration
+                field {
+                  ... on ProjectV2FieldCommon {
+                    name
+                  }
+                }
+              }
             }
           }
         }
@@ -327,33 +387,114 @@ foreach ($item in $items) {
     
     $projectInfo = gh api graphql -f query=$issueQuery | ConvertFrom-Json
 
-    $sourceDates = $projectInfo.data.repository.issue.projectItems.nodes |
+    # Debug: Show all projects this issue belongs to
+    $allProjects = $projectInfo.data.repository.issue.projectItems.nodes
+    if ($allProjects -and $allProjects.Count -gt 0) {
+        Write-Host "  📁 Found in $($allProjects.Count) project(s):" -ForegroundColor DarkGray
+        foreach ($proj in $allProjects) {
+            Write-Host "     - $($proj.project.title)" -ForegroundColor DarkGray
+        }
+    }
+
+    # Collect data from all SOURCE projects (excluding the consolidated project)
+    # The consolidated project is the target, all others are sources
+    $allSourceDates = $projectInfo.data.repository.issue.projectItems.nodes |
+        Where-Object { $_.project.id -ne $projectId } |  # Exclude the consolidated project
         ForEach-Object {
             $dateFields = @{}
+            $iterationInfo = $null
+            $projectTitle = $_.project.title
+            
+            # Debug: Show which project we're processing
+            Write-Host "  🔍 Checking project: $projectTitle" -ForegroundColor DarkGray
+            
             foreach ($fieldValue in $_.fieldValues.nodes) {
-                if ($fieldValue.field.name -eq $startFieldName -and $fieldValue.date) {
+                # Debug: Show field names found
+                if ($fieldValue.field -and $fieldValue.field.name) {
+                    Write-Host "     Field: '$($fieldValue.field.name)'" -ForegroundColor DarkGray
+                }
+                
+                # Start Date (case-insensitive)
+                if ((Compare-FieldName $fieldValue.field.name $startFieldName) -and $fieldValue.date) {
                     $dateFields['Start'] = $fieldValue.date
+                    $dateFields['StartSource'] = 'Start Date'
+                    Write-Host "     ✓ Found Start Date: $($fieldValue.date)" -ForegroundColor DarkGray
                 }
-                if ($fieldValue.field.name -eq $endFieldName -and $fieldValue.date) {
+                # End Date (case-insensitive, first priority)
+                if ((Compare-FieldName $fieldValue.field.name $endFieldName) -and $fieldValue.date) {
                     $dateFields['End'] = $fieldValue.date
+                    $dateFields['EndSource'] = 'End Date'
+                    Write-Host "     ✓ Found End Date: $($fieldValue.date)" -ForegroundColor DarkGray
                 }
-                if ($fieldValue.field.name -eq $statusFieldName -and $fieldValue.name) {
+                # Target Date (case-insensitive, fallback if End Date not found)
+                if ((Compare-FieldName $fieldValue.field.name $targetFieldName) -and $fieldValue.date -and -not $dateFields['End']) {
+                    $dateFields['End'] = $fieldValue.date
+                    $dateFields['EndSource'] = 'Target Date'
+                    Write-Host "     ✓ Found Target Date: $($fieldValue.date)" -ForegroundColor DarkGray
+                }
+                # Iteration (case-insensitive)
+                if ((Compare-FieldName $fieldValue.field.name $iterationFieldName) -and $fieldValue.title) {
+                    $iterationInfo = @{
+                        Title = $fieldValue.title
+                        StartDate = $fieldValue.startDate
+                        Duration = $fieldValue.duration
+                    }
+                    Write-Host "     ✓ Found Iteration: $($fieldValue.title)" -ForegroundColor DarkGray
+                    Write-Host "       - Start: $($fieldValue.startDate), Duration: $($fieldValue.duration) days" -ForegroundColor DarkGray
+                }
+                # Status (case-insensitive)
+                if ((Compare-FieldName $fieldValue.field.name $statusFieldName) -and $fieldValue.name) {
                     # Remove everything before the first letter (emojis and symbols)
                     $cleanStatus = $fieldValue.name -replace '^[^a-zA-Z]+', ''
                     $dateFields['Status'] = $cleanStatus.Trim()
+                    Write-Host "     ✓ Found Status: $($cleanStatus.Trim())" -ForegroundColor DarkGray
                 }
             }
+            
+            # If we don't have Start or End dates, try to get them from Iteration
+            if ($iterationInfo) {
+                if (-not $dateFields['Start'] -and $iterationInfo.StartDate) {
+                    $dateFields['Start'] = $iterationInfo.StartDate
+                    $dateFields['StartSource'] = "Iteration ($($iterationInfo.Title))"
+                    Write-Host "     ✓ Using Iteration Start Date: $($iterationInfo.StartDate)" -ForegroundColor DarkGray
+                }
+                if (-not $dateFields['End'] -and $iterationInfo.StartDate -and $iterationInfo.Duration) {
+                    $startDate = [DateTime]::Parse($iterationInfo.StartDate)
+                    $endDate = $startDate.AddDays($iterationInfo.Duration)
+                    $dateFields['End'] = $endDate.ToString("yyyy-MM-dd")
+                    $dateFields['EndSource'] = "Iteration ($($iterationInfo.Title))"
+                    Write-Host "     ✓ Using Iteration End Date: $($endDate.ToString('yyyy-MM-dd'))" -ForegroundColor DarkGray
+                }
+            }
+            
             if ($dateFields.Count -gt 0) { $dateFields }
-        } | Select-Object -First 1
+        }
+    
+    # Select the best source: prioritize entries with both Start and End dates
+    $sourceDates = $allSourceDates | 
+        Sort-Object -Property @{Expression = {
+            $score = 0
+            if ($_.Start) { $score += 10 }
+            if ($_.End) { $score += 10 }
+            if ($_.Status) { $score += 1 }
+            $score
+        }; Descending = $true} |
+        Select-Object -First 1
 
     if (-not $sourceDates) {
         Write-Host "  ⚠️  No dates or status found in source project" -ForegroundColor Yellow
         continue
     }
 
-    Write-Host "  ✓ Start:  $($sourceDates.Start)" -ForegroundColor Gray
-    Write-Host "  ✓ End:    $($sourceDates.End)" -ForegroundColor Gray
-    Write-Host "  ✓ Status: $($sourceDates.Status)" -ForegroundColor Gray
+    if ($sourceDates.Start) {
+        Write-Host "  ✓ Start:  $($sourceDates.Start) (from $($sourceDates.StartSource))" -ForegroundColor Gray
+    }
+    if ($sourceDates.End) {
+        Write-Host "  ✓ End:    $($sourceDates.End) (from $($sourceDates.EndSource))" -ForegroundColor Gray
+    }
+    if ($sourceDates.Status) {
+        Write-Host "  ✓ Status: $($sourceDates.Status)" -ForegroundColor Gray
+    }
 
     # Update consolidated project item with dates and status
     # First update date fields
@@ -361,7 +502,8 @@ foreach ($item in $items) {
         $dateValue = if ($fieldName -eq $startFieldName) { $sourceDates.Start } else { $sourceDates.End }
         if (-not $dateValue) { continue }
 
-        $fieldId = $fieldMap[$fieldName]
+        # Find field ID using case-insensitive lookup
+        $fieldId = $fieldMap[$fieldName.ToLower()]
         
         if (-not $fieldId) {
             Write-Host "  ⚠️  Field '$fieldName' not found in project" -ForegroundColor Yellow
@@ -397,18 +539,18 @@ mutation {
     # Update status field (single-select)
     if ($sourceDates.Status) {
         $statusValue = $sourceDates.Status
-        $statusFieldId = $fieldMap[$statusFieldName]
+        $statusFieldId = $fieldMap[$statusFieldName.ToLower()]
         
         if (-not $statusFieldId) {
             Write-Host "  ⚠️  Field '$statusFieldName' not found in project" -ForegroundColor Yellow
-        } elseif (-not $fieldOptionsMap[$statusFieldName]) {
+        } elseif (-not $fieldOptionsMap[$statusFieldName.ToLower()]) {
             Write-Host "  ⚠️  Field '$statusFieldName' is not a single-select field" -ForegroundColor Yellow
         } else {
-            $statusOptionId = $fieldOptionsMap[$statusFieldName][$statusValue]
+            $statusOptionId = $fieldOptionsMap[$statusFieldName.ToLower()][$statusValue]
             
             if (-not $statusOptionId) {
                 Write-Host "  ⚠️  Status option '$statusValue' not found" -ForegroundColor Yellow
-                Write-Host "     Available options: $($fieldOptionsMap[$statusFieldName].Keys -join ', ')" -ForegroundColor Gray
+                Write-Host "     Available options: $($fieldOptionsMap[$statusFieldName.ToLower()].Keys -join ', ')" -ForegroundColor Gray
             } else {
                 $statusMutation = @"
 mutation {
